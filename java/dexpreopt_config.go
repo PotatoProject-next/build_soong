@@ -15,39 +15,12 @@
 package java
 
 import (
-	"fmt"
 	"path/filepath"
 	"strings"
 
 	"android/soong/android"
 	"android/soong/dexpreopt"
 )
-
-// systemServerClasspath returns the on-device locations of the modules in the system server classpath.  It is computed
-// once the first time it is called for any ctx.Config(), and returns the same slice for all future calls with the same
-// ctx.Config().
-func systemServerClasspath(ctx android.PathContext) []string {
-	return ctx.Config().OnceStringSlice(systemServerClasspathKey, func() []string {
-		global := dexpreopt.GetGlobalConfig(ctx)
-		var systemServerClasspathLocations []string
-		nonUpdatable := dexpreopt.NonUpdatableSystemServerJars(ctx, global)
-		// 1) Non-updatable jars.
-		for _, m := range nonUpdatable {
-			systemServerClasspathLocations = append(systemServerClasspathLocations,
-				filepath.Join("/system/framework", m+".jar"))
-		}
-		// 2) The jars that are from an updatable apex.
-		systemServerClasspathLocations = append(systemServerClasspathLocations,
-			global.UpdatableSystemServerJars.DevicePaths(ctx.Config(), android.Android)...)
-
-		if expectedLen := global.SystemServerJars.Len() + global.UpdatableSystemServerJars.Len(); expectedLen != len(systemServerClasspathLocations) {
-			panic(fmt.Errorf("wrong number of system server jars, got %d, expected %d", len(systemServerClasspathLocations), expectedLen))
-		}
-		return systemServerClasspathLocations
-	})
-}
-
-var systemServerClasspathKey = android.NewOnceKey("systemServerClasspath")
 
 // dexpreoptTargets returns the list of targets that are relevant to dexpreopting, which excludes architectures
 // supported through native bridge.
@@ -127,6 +100,7 @@ func genBootImageConfigs(ctx android.PathContext) map[string]*bootImageConfig {
 			// TODO(b/143682396): use module dependencies instead
 			inputDir := deviceDir.Join(ctx, "dex_"+c.name+"jars_input")
 			c.dexPaths = c.modules.BuildPaths(ctx, inputDir)
+			c.dexPathsByModule = c.modules.BuildPathsByModule(ctx, inputDir)
 			c.dexPathsDeps = c.dexPaths
 
 			// Create target-specific variants.
@@ -152,6 +126,7 @@ func genBootImageConfigs(ctx android.PathContext) map[string]*bootImageConfig {
 		frameworkCfg.dexPathsDeps = append(artCfg.dexPathsDeps, frameworkCfg.dexPathsDeps...)
 		for i := range targets {
 			frameworkCfg.variants[i].primaryImages = artCfg.variants[i].imagePathOnHost
+			frameworkCfg.variants[i].primaryImagesDeps = artCfg.variants[i].imagesDeps.Paths()
 			frameworkCfg.variants[i].dexLocationsDeps = append(artCfg.variants[i].dexLocations, frameworkCfg.variants[i].dexLocationsDeps...)
 		}
 
@@ -179,6 +154,9 @@ type updatableBootConfig struct {
 	// later on a singleton adds commands to copy actual jars to the predefined paths.
 	dexPaths android.WritablePaths
 
+	// Map from module name (without prebuilt_ prefix) to the predefined build path.
+	dexPathsByModule map[string]android.WritablePath
+
 	// A list of dex locations (a.k.a. on-device paths) to the boot jars.
 	dexLocations []string
 }
@@ -192,10 +170,11 @@ func GetUpdatableBootConfig(ctx android.PathContext) updatableBootConfig {
 
 		dir := android.PathForOutput(ctx, ctx.Config().DeviceName(), "updatable_bootjars")
 		dexPaths := updatableBootJars.BuildPaths(ctx, dir)
+		dexPathsByModuleName := updatableBootJars.BuildPathsByModule(ctx, dir)
 
 		dexLocations := updatableBootJars.DevicePaths(ctx.Config(), android.Android)
 
-		return updatableBootConfig{updatableBootJars, dexPaths, dexLocations}
+		return updatableBootConfig{updatableBootJars, dexPaths, dexPathsByModuleName, dexLocations}
 	}).(updatableBootConfig)
 }
 

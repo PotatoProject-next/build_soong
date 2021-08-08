@@ -15,6 +15,7 @@
 package android
 
 import (
+	"android/soong/bazel"
 	"encoding"
 	"fmt"
 	"reflect"
@@ -897,7 +898,7 @@ func createArchPropTypeDesc(props reflect.Type) []archPropTypeDesc {
 
 			// Add the OS/Arch combinations, e.g. "android_arm64".
 			for _, archType := range osArchTypeMap[os] {
-				targets = append(targets, os.Field+"_"+archType.Name)
+				targets = append(targets, GetCompoundTargetField(os, archType))
 
 				// Also add the special "linux_<arch>" and "bionic_<arch>" property structs.
 				if os.Linux() {
@@ -1217,6 +1218,10 @@ func getMultilibStruct(ctx ArchVariantContext, archProperties interface{}, archT
 	return getChildPropertyStruct(ctx, multilibProp, archType.Multilib, "multilib."+archType.Multilib)
 }
 
+func GetCompoundTargetField(os OsType, arch ArchType) string {
+	return os.Field + "_" + arch.Name
+}
+
 // Returns the structs corresponding to the properties specific to the given
 // architecture and OS in archProperties.
 func getArchProperties(ctx BaseMutatorContext, archProperties interface{}, arch Arch, os OsType, nativeBridgeEnabled bool) []reflect.Value {
@@ -1323,7 +1328,7 @@ func getArchProperties(ctx BaseMutatorContext, archProperties interface{}, arch 
 		//         key: value,
 		//     },
 		// },
-		field := os.Field + "_" + archType.Name
+		field := GetCompoundTargetField(os, archType)
 		userFriendlyField := "target." + os.Name + "_" + archType.Name
 		if osArchProperties, ok := getChildPropertyStruct(ctx, targetProp, field, userFriendlyField); ok {
 			result = append(result, osArchProperties)
@@ -1561,23 +1566,26 @@ type archConfig struct {
 	abi         []string
 }
 
-// getNdkAbisConfig returns a list of archConfigs for the ABIs supported by the NDK.
+// getNdkAbisConfig returns the list of archConfigs that are used for bulding
+// the API stubs and static libraries that are included in the NDK. These are
+// built *without Neon*, because non-Neon is still supported and building these
+// with Neon will break those users.
 func getNdkAbisConfig() []archConfig {
 	return []archConfig{
-		{"arm", "armv7-a", "", []string{"armeabi-v7a"}},
 		{"arm64", "armv8-a-branchprot", "", []string{"arm64-v8a"}},
-		{"x86", "", "", []string{"x86"}},
+		{"arm", "armv7-a", "", []string{"armeabi-v7a"}},
 		{"x86_64", "", "", []string{"x86_64"}},
+		{"x86", "", "", []string{"x86"}},
 	}
 }
 
 // getAmlAbisConfig returns a list of archConfigs for the ABIs supported by mainline modules.
 func getAmlAbisConfig() []archConfig {
 	return []archConfig{
-		{"arm", "armv7-a-neon", "", []string{"armeabi-v7a"}},
 		{"arm64", "armv8-a", "", []string{"arm64-v8a"}},
-		{"x86", "", "", []string{"x86"}},
+		{"arm", "armv7-a-neon", "", []string{"armeabi-v7a"}},
 		{"x86_64", "", "", []string{"x86_64"}},
+		{"x86", "", "", []string{"x86"}},
 	}
 }
 
@@ -1878,27 +1886,38 @@ type ArchVariantContext interface {
 	PropertyErrorf(property, fmt string, args ...interface{})
 }
 
-// GetArchProperties returns a map of architectures to the values of the
-// properties of the 'propertySet' struct that are specific to that architecture.
+// ArchVariantProperties represents a map of arch-variant config strings to a property interface{}.
+type ArchVariantProperties map[string]interface{}
+
+// ConfigurationAxisToArchVariantProperties represents a map of bazel.ConfigurationAxis to
+// ArchVariantProperties, such that each independent arch-variant axis maps to the
+// configs/properties for that axis.
+type ConfigurationAxisToArchVariantProperties map[bazel.ConfigurationAxis]ArchVariantProperties
+
+// GetArchVariantProperties returns a ConfigurationAxisToArchVariantProperties where the
+// arch-variant properties correspond to the values of the properties of the 'propertySet' struct
+// that are specific to that axis/configuration. Each axis is independent, containing
+// non-overlapping configs that correspond to the various "arch-variant" support, at this time:
+//    arches (including multilib)
+//    oses
+//    arch+os combinations
 //
-// For example, passing a struct { Foo bool, Bar string } will return an
-// interface{} that can be type asserted back into the same struct, containing
-// the arch specific property value specified by the module if defined.
+// For example, passing a struct { Foo bool, Bar string } will return an interface{} that can be
+// type asserted back into the same struct, containing the config-specific property value specified
+// by the module if defined.
 //
 // Arch-specific properties may come from an arch stanza or a multilib stanza; properties
 // in these stanzas are combined.
 // For example: `arch: { x86: { Foo: ["bar"] } }, multilib: { lib32: {` Foo: ["baz"] } }`
 // will result in `Foo: ["bar", "baz"]` being returned for architecture x86, if the given
 // propertyset contains `Foo []string`.
-//
-// Implemented in a way very similar to GetTargetProperties().
-func (m *ModuleBase) GetArchProperties(ctx ArchVariantContext, propertySet interface{}) map[ArchType]interface{} {
+func (m *ModuleBase) GetArchVariantProperties(ctx ArchVariantContext, propertySet interface{}) ConfigurationAxisToArchVariantProperties {
 	// Return value of the arch types to the prop values for that arch.
-	archToProp := map[ArchType]interface{}{}
+	axisToProps := ConfigurationAxisToArchVariantProperties{}
 
 	// Nothing to do for non-arch-specific modules.
 	if !m.ArchSpecific() {
-		return archToProp
+		return axisToProps
 	}
 
 	dstType := reflect.ValueOf(propertySet).Type()
@@ -1916,9 +1935,10 @@ func (m *ModuleBase) GetArchProperties(ctx ArchVariantContext, propertySet inter
 
 	if archProperties == nil {
 		// This module does not have the property set requested
-		return archToProp
+		return axisToProps
 	}
 
+	archToProp := ArchVariantProperties{}
 	// For each arch type (x86, arm64, etc.)
 	for _, arch := range ArchTypeList() {
 		// Arch properties are sometimes sharded (see createArchPropTypeDesc() ).
@@ -1944,87 +1964,64 @@ func (m *ModuleBase) GetArchProperties(ctx ArchVariantContext, propertySet inter
 			mergePropertyStruct(ctx, value, propertyStruct)
 		}
 
-		archToProp[arch] = value
+		archToProp[arch.Name] = value
 	}
+	axisToProps[bazel.ArchConfigurationAxis] = archToProp
 
-	return archToProp
-}
-
-// Returns the struct containing the properties specific to the given
-// architecture type. These look like this in Blueprint files:
-// target: {
-//     android: {
-//         key: value,
-//     },
-// },
-// This struct will also contain sub-structs containing to the architecture/CPU
-// variants and features that themselves contain properties specific to those.
-func getTargetStruct(ctx ArchVariantContext, archProperties interface{}, os OsType) (reflect.Value, bool) {
-	archPropValues := reflect.ValueOf(archProperties).Elem()
-	targetProp := archPropValues.FieldByName("Target").Elem()
-	return getChildPropertyStruct(ctx, targetProp, os.Field, os.Field)
-}
-
-// GetTargetProperties returns a map of OS target (e.g. android, windows) to the
-// values of the properties of the 'propertySet' struct that are specific to
-// that OS target.
-//
-// For example, passing a struct { Foo bool, Bar string } will return an
-// interface{} that can be type asserted back into the same struct, containing
-// the os-specific property value specified by the module if defined.
-//
-// Implemented in a way very similar to GetArchProperties().
-func (m *ModuleBase) GetTargetProperties(ctx ArchVariantContext, propertySet interface{}) map[OsType]interface{} {
-	// Return value of the arch types to the prop values for that arch.
-	osToProp := map[OsType]interface{}{}
-
-	// Nothing to do for non-OS/arch-specific modules.
-	if !m.ArchSpecific() {
-		return osToProp
-	}
-
-	dstType := reflect.ValueOf(propertySet).Type()
-	var archProperties []interface{}
-
-	// First find the property set in the module that corresponds to the requested
-	// one. m.archProperties[i] corresponds to m.generalProperties[i].
-	for i, generalProp := range m.generalProperties {
-		srcType := reflect.ValueOf(generalProp).Type()
-		if srcType == dstType {
-			archProperties = m.archProperties[i]
-			break
-		}
-	}
-
-	if archProperties == nil {
-		// This module does not have the property set requested
-		return osToProp
-	}
-
+	osToProp := ArchVariantProperties{}
+	archOsToProp := ArchVariantProperties{}
+	// For android, linux, ...
 	for _, os := range osTypeList {
 		if os == CommonOS {
 			// It looks like this OS value is not used in Blueprint files
 			continue
 		}
-
-		propertyStructs := make([]reflect.Value, 0)
-		for _, archProperty := range archProperties {
-			targetStruct, ok := getTargetStruct(ctx, archProperty, os)
-			if ok {
-				propertyStructs = append(propertyStructs, targetStruct)
-			}
+		osToProp[os.Name] = getTargetStruct(ctx, propertySet, archProperties, os.Field)
+		// For arm, x86, ...
+		for _, arch := range osArchTypeMap[os] {
+			targetField := GetCompoundTargetField(os, arch)
+			targetName := fmt.Sprintf("%s_%s", os.Name, arch.Name)
+			archOsToProp[targetName] = getTargetStruct(ctx, propertySet, archProperties, targetField)
 		}
+	}
+	axisToProps[bazel.OsConfigurationAxis] = osToProp
+	axisToProps[bazel.OsArchConfigurationAxis] = archOsToProp
 
-		// Create a new instance of the requested property set
-		value := reflect.New(reflect.ValueOf(propertySet).Elem().Type()).Interface()
+	return axisToProps
+}
 
-		// Merge all the structs together
-		for _, propertyStruct := range propertyStructs {
-			mergePropertyStruct(ctx, value, propertyStruct)
+// Returns a struct matching the propertySet interface, containing properties specific to the targetName
+// For example, given these arguments:
+//    propertySet = BaseCompilerProperties
+//    targetName = "android_arm"
+// And given this Android.bp fragment:
+//    target:
+//       android_arm: {
+//          srcs: ["foo.c"],
+//       }
+//       android_arm64: {
+//          srcs: ["bar.c"],
+//      }
+//    }
+// This would return a BaseCompilerProperties with BaseCompilerProperties.Srcs = ["foo.c"]
+func getTargetStruct(ctx ArchVariantContext, propertySet interface{}, archProperties []interface{}, targetName string) interface{} {
+	propertyStructs := make([]reflect.Value, 0)
+	for _, archProperty := range archProperties {
+		archPropValues := reflect.ValueOf(archProperty).Elem()
+		targetProp := archPropValues.FieldByName("Target").Elem()
+		targetStruct, ok := getChildPropertyStruct(ctx, targetProp, targetName, targetName)
+		if ok {
+			propertyStructs = append(propertyStructs, targetStruct)
 		}
-
-		osToProp[os] = value
 	}
 
-	return osToProp
+	// Create a new instance of the requested property set
+	value := reflect.New(reflect.ValueOf(propertySet).Elem().Type()).Interface()
+
+	// Merge all the structs together
+	for _, propertyStruct := range propertyStructs {
+		mergePropertyStruct(ctx, value, propertyStruct)
+	}
+
+	return value
 }

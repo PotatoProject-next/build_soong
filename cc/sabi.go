@@ -45,12 +45,6 @@ func (sabi *sabi) props() []interface{} {
 	return []interface{}{&sabi.Properties}
 }
 
-func (sabi *sabi) begin(ctx BaseModuleContext) {}
-
-func (sabi *sabi) deps(ctx BaseModuleContext, deps Deps) Deps {
-	return deps
-}
-
 func (sabi *sabi) flags(ctx ModuleContext, flags Flags) Flags {
 	// Filter out flags which libTooling don't understand.
 	// This is here for legacy reasons and future-proof, in case the version of libTooling and clang
@@ -192,7 +186,7 @@ func sabiDepsMutator(mctx android.TopDownMutatorContext) {
 			// Mark all of its static library dependencies.
 			mctx.VisitDirectDeps(func(child android.Module) {
 				depTag := mctx.OtherModuleDependencyTag(child)
-				if libDepTag, ok := depTag.(libraryDependencyTag); ok && libDepTag.static() {
+				if IsStaticDepTag(depTag) || depTag == reuseObjTag {
 					if c, ok := child.(*Module); ok && c.sabi != nil {
 						// Mark this module so that .sdump for this static library can be generated.
 						c.sabi.Properties.ShouldCreateSourceAbiDump = true

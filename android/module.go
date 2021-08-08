@@ -165,13 +165,20 @@ type BaseModuleContext interface {
 	// OtherModuleDependencyVariantExists returns true if a module with the
 	// specified name and variant exists. The variant must match the given
 	// variations. It must also match all the non-local variations of the current
-	// module. In other words, it checks for the module AddVariationDependencies
+	// module. In other words, it checks for the module that AddVariationDependencies
 	// would add a dependency on with the same arguments.
 	OtherModuleDependencyVariantExists(variations []blueprint.Variation, name string) bool
 
+	// OtherModuleFarDependencyVariantExists returns true if a module with the
+	// specified name and variant exists. The variant must match the given
+	// variations, but not the non-local variations of the current module. In
+	// other words, it checks for the module that AddFarVariationDependencies
+	// would add a dependency on with the same arguments.
+	OtherModuleFarDependencyVariantExists(variations []blueprint.Variation, name string) bool
+
 	// OtherModuleReverseDependencyVariantExists returns true if a module with the
 	// specified name exists with the same variations as the current module. In
-	// other words, it checks for the module AddReverseDependency would add a
+	// other words, it checks for the module that AddReverseDependency would add a
 	// dependency on with the same argument.
 	OtherModuleReverseDependencyVariantExists(name string) bool
 
@@ -337,8 +344,18 @@ type ModuleContext interface {
 	// Deprecated: use ModuleContext.Build instead.
 	ModuleBuild(pctx PackageContext, params ModuleBuildParams)
 
+	// Returns a list of paths expanded from globs and modules referenced using ":module" syntax.  The property must
+	// be tagged with `android:"path" to support automatic source module dependency resolution.
+	//
+	// Deprecated: use PathsForModuleSrc or PathsForModuleSrcExcludes instead.
 	ExpandSources(srcFiles, excludes []string) Paths
+
+	// Returns a single path expanded from globs and modules referenced using ":module" syntax.  The property must
+	// be tagged with `android:"path" to support automatic source module dependency resolution.
+	//
+	// Deprecated: use PathForModuleSrc instead.
 	ExpandSource(srcFile, prop string) Path
+
 	ExpandOptionalSource(srcFile *string, prop string) OptionalPath
 
 	// InstallExecutable creates a rule to copy srcPath to name in the installPath directory,
@@ -466,6 +483,7 @@ type Module interface {
 	InitRc() Paths
 	VintfFragments() Paths
 	NoticeFiles() Paths
+	EffectiveLicenseFiles() Paths
 
 	AddProperties(props ...interface{})
 	GetProperties() []interface{}
@@ -1183,6 +1201,10 @@ type ModuleBase struct {
 	vintfFragmentsPaths Paths
 }
 
+func (m *ModuleBase) AddJSONData(d *map[string]interface{}) {
+	(*d)["Android"] = map[string]interface{}{}
+}
+
 func (m *ModuleBase) ComponentDepsMutator(BottomUpMutatorContext) {}
 
 func (m *ModuleBase) DepsMutator(BottomUpMutatorContext) {}
@@ -1492,6 +1514,10 @@ func (m *ModuleBase) IsReplacedByPrebuilt() bool {
 
 func (m *ModuleBase) ExportedToMake() bool {
 	return m.commonProperties.NamespaceExportedToMake
+}
+
+func (m *ModuleBase) EffectiveLicenseFiles() Paths {
+	return m.commonProperties.Effective_license_text
 }
 
 // computeInstallDeps finds the installed paths of all dependencies that have a dependency
@@ -1809,8 +1835,8 @@ func (m *ModuleBase) GenerateBuildActions(blueprintCtx blueprint.ModuleContext) 
 	if m.Enabled() {
 		// ensure all direct android.Module deps are enabled
 		ctx.VisitDirectDepsBlueprint(func(bm blueprint.Module) {
-			if _, ok := bm.(Module); ok {
-				ctx.validateAndroidModule(bm, ctx.baseModuleContext.strictVisitDeps)
+			if m, ok := bm.(Module); ok {
+				ctx.validateAndroidModule(bm, ctx.OtherModuleDependencyTag(m), ctx.baseModuleContext.strictVisitDeps)
 			}
 		})
 
@@ -2021,6 +2047,9 @@ func (b *baseModuleContext) OtherModuleDependencyTag(m blueprint.Module) bluepri
 func (b *baseModuleContext) OtherModuleExists(name string) bool { return b.bp.OtherModuleExists(name) }
 func (b *baseModuleContext) OtherModuleDependencyVariantExists(variations []blueprint.Variation, name string) bool {
 	return b.bp.OtherModuleDependencyVariantExists(variations, name)
+}
+func (b *baseModuleContext) OtherModuleFarDependencyVariantExists(variations []blueprint.Variation, name string) bool {
+	return b.bp.OtherModuleFarDependencyVariantExists(variations, name)
 }
 func (b *baseModuleContext) OtherModuleReverseDependencyVariantExists(name string) bool {
 	return b.bp.OtherModuleReverseDependencyVariantExists(name)
@@ -2234,7 +2263,12 @@ func (b *baseModuleContext) AddMissingDependencies(deps []string) {
 	}
 }
 
-func (b *baseModuleContext) validateAndroidModule(module blueprint.Module, strict bool) Module {
+type AllowDisabledModuleDependency interface {
+	blueprint.DependencyTag
+	AllowDisabledModuleDependency(target Module) bool
+}
+
+func (b *baseModuleContext) validateAndroidModule(module blueprint.Module, tag blueprint.DependencyTag, strict bool) Module {
 	aModule, _ := module.(Module)
 
 	if !strict {
@@ -2247,10 +2281,12 @@ func (b *baseModuleContext) validateAndroidModule(module blueprint.Module, stric
 	}
 
 	if !aModule.Enabled() {
-		if b.Config().AllowMissingDependencies() {
-			b.AddMissingDependencies([]string{b.OtherModuleName(aModule)})
-		} else {
-			b.ModuleErrorf("depends on disabled module %q", b.OtherModuleName(aModule))
+		if t, ok := tag.(AllowDisabledModuleDependency); !ok || !t.AllowDisabledModuleDependency(aModule) {
+			if b.Config().AllowMissingDependencies() {
+				b.AddMissingDependencies([]string{b.OtherModuleName(aModule)})
+			} else {
+				b.ModuleErrorf("depends on disabled module %q", b.OtherModuleName(aModule))
+			}
 		}
 		return nil
 	}
@@ -2343,7 +2379,7 @@ func (b *baseModuleContext) VisitDirectDepsBlueprint(visit func(blueprint.Module
 
 func (b *baseModuleContext) VisitDirectDeps(visit func(Module)) {
 	b.bp.VisitDirectDeps(func(module blueprint.Module) {
-		if aModule := b.validateAndroidModule(module, b.strictVisitDeps); aModule != nil {
+		if aModule := b.validateAndroidModule(module, b.bp.OtherModuleDependencyTag(module), b.strictVisitDeps); aModule != nil {
 			visit(aModule)
 		}
 	})
@@ -2351,7 +2387,7 @@ func (b *baseModuleContext) VisitDirectDeps(visit func(Module)) {
 
 func (b *baseModuleContext) VisitDirectDepsWithTag(tag blueprint.DependencyTag, visit func(Module)) {
 	b.bp.VisitDirectDeps(func(module blueprint.Module) {
-		if aModule := b.validateAndroidModule(module, b.strictVisitDeps); aModule != nil {
+		if aModule := b.validateAndroidModule(module, b.bp.OtherModuleDependencyTag(module), b.strictVisitDeps); aModule != nil {
 			if b.bp.OtherModuleDependencyTag(aModule) == tag {
 				visit(aModule)
 			}
@@ -2363,7 +2399,7 @@ func (b *baseModuleContext) VisitDirectDepsIf(pred func(Module) bool, visit func
 	b.bp.VisitDirectDepsIf(
 		// pred
 		func(module blueprint.Module) bool {
-			if aModule := b.validateAndroidModule(module, b.strictVisitDeps); aModule != nil {
+			if aModule := b.validateAndroidModule(module, b.bp.OtherModuleDependencyTag(module), b.strictVisitDeps); aModule != nil {
 				return pred(aModule)
 			} else {
 				return false
@@ -2377,7 +2413,7 @@ func (b *baseModuleContext) VisitDirectDepsIf(pred func(Module) bool, visit func
 
 func (b *baseModuleContext) VisitDepsDepthFirst(visit func(Module)) {
 	b.bp.VisitDepsDepthFirst(func(module blueprint.Module) {
-		if aModule := b.validateAndroidModule(module, b.strictVisitDeps); aModule != nil {
+		if aModule := b.validateAndroidModule(module, b.bp.OtherModuleDependencyTag(module), b.strictVisitDeps); aModule != nil {
 			visit(aModule)
 		}
 	})
@@ -2387,7 +2423,7 @@ func (b *baseModuleContext) VisitDepsDepthFirstIf(pred func(Module) bool, visit 
 	b.bp.VisitDepsDepthFirstIf(
 		// pred
 		func(module blueprint.Module) bool {
-			if aModule := b.validateAndroidModule(module, b.strictVisitDeps); aModule != nil {
+			if aModule := b.validateAndroidModule(module, b.bp.OtherModuleDependencyTag(module), b.strictVisitDeps); aModule != nil {
 				return pred(aModule)
 			} else {
 				return false
@@ -2776,30 +2812,57 @@ func (m *moduleContext) blueprintModuleContext() blueprint.ModuleContext {
 	return m.bp
 }
 
-// SrcIsModule decodes module references in the format ":name" into the module name, or empty string if the input
-// was not a module reference.
+// SrcIsModule decodes module references in the format ":unqualified-name" or "//namespace:name"
+// into the module name, or empty string if the input was not a module reference.
 func SrcIsModule(s string) (module string) {
-	if len(s) > 1 && s[0] == ':' {
-		return s[1:]
+	if len(s) > 1 {
+		if s[0] == ':' {
+			module = s[1:]
+			if !isUnqualifiedModuleName(module) {
+				// The module name should be unqualified but is not so do not treat it as a module.
+				module = ""
+			}
+		} else if s[0] == '/' && s[1] == '/' {
+			module = s
+		}
 	}
-	return ""
+	return module
 }
 
-// SrcIsModule decodes module references in the format ":name{.tag}" into the module name and tag, ":name" into the
-// module name and an empty string for the tag, or empty strings if the input was not a module reference.
+// SrcIsModule decodes module references in the format ":unqualified-name{.tag}" or
+// "//namespace:name{.tag}" into the module name and an empty string for the tag, or empty strings
+// if the input was not a module reference.
 func SrcIsModuleWithTag(s string) (module, tag string) {
-	if len(s) > 1 && s[0] == ':' {
-		module = s[1:]
-		if tagStart := strings.IndexByte(module, '{'); tagStart > 0 {
-			if module[len(module)-1] == '}' {
-				tag = module[tagStart+1 : len(module)-1]
-				module = module[:tagStart]
-				return module, tag
+	if len(s) > 1 {
+		if s[0] == ':' {
+			module = s[1:]
+		} else if s[0] == '/' && s[1] == '/' {
+			module = s
+		}
+
+		if module != "" {
+			if tagStart := strings.IndexByte(module, '{'); tagStart > 0 {
+				if module[len(module)-1] == '}' {
+					tag = module[tagStart+1 : len(module)-1]
+					module = module[:tagStart]
+				}
+			}
+
+			if s[0] == ':' && !isUnqualifiedModuleName(module) {
+				// The module name should be unqualified but is not so do not treat it as a module.
+				module = ""
+				tag = ""
 			}
 		}
-		return module, ""
 	}
-	return "", ""
+
+	return module, tag
+}
+
+// isUnqualifiedModuleName makes sure that the supplied module is an unqualified module name, i.e.
+// does not contain any /.
+func isUnqualifiedModuleName(module string) bool {
+	return strings.IndexByte(module, '/') == -1
 }
 
 type sourceOrOutputDependencyTag struct {
@@ -2811,7 +2874,25 @@ func sourceOrOutputDepTag(tag string) blueprint.DependencyTag {
 	return sourceOrOutputDependencyTag{tag: tag}
 }
 
+// Deprecated, use IsSourceDepTagWithOutputTag(tag, "") instead.
 var SourceDepTag = sourceOrOutputDepTag("")
+
+// IsSourceDepTag returns true if the supplied blueprint.DependencyTag is one that was used to add
+// dependencies by either ExtractSourceDeps, ExtractSourcesDeps or automatically for properties
+// tagged with `android:"path"`.
+func IsSourceDepTag(depTag blueprint.DependencyTag) bool {
+	_, ok := depTag.(sourceOrOutputDependencyTag)
+	return ok
+}
+
+// IsSourceDepTagWithOutputTag returns true if the supplied blueprint.DependencyTag is one that was
+// used to add dependencies by either ExtractSourceDeps, ExtractSourcesDeps or automatically for
+// properties tagged with `android:"path"` AND it was added using a module reference of
+// :moduleName{outputTag}.
+func IsSourceDepTagWithOutputTag(depTag blueprint.DependencyTag, outputTag string) bool {
+	t, ok := depTag.(sourceOrOutputDependencyTag)
+	return ok && t.tag == outputTag
+}
 
 // Adds necessary dependencies to satisfy filegroup or generated sources modules listed in srcFiles
 // using ":module" syntax, if any.

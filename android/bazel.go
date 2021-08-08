@@ -138,7 +138,6 @@ var (
 		// e.g. ERROR: Analysis of target '@soong_injection//mixed_builds:buildroot' failed
 		"external/bazelbuild-rules_android":/* recursive = */ true,
 
-		"prebuilts/clang/host/linux-x86":/* recursive = */ false,
 		"prebuilts/sdk":/* recursive = */ false,
 		"prebuilts/sdk/tools":/* recursive = */ false,
 	}
@@ -155,13 +154,12 @@ var (
 		"external/fmtlib":                 Bp2BuildDefaultTrueRecursively,
 		"external/arm-optimized-routines": Bp2BuildDefaultTrueRecursively,
 		"external/scudo":                  Bp2BuildDefaultTrueRecursively,
+		"prebuilts/clang/host/linux-x86":  Bp2BuildDefaultTrueRecursively,
 	}
 
 	// Per-module denylist to always opt modules out of both bp2build and mixed builds.
 	bp2buildModuleDoNotConvertList = []string{
 		// Things that transitively depend on unconverted libc_* modules.
-		"libc_nomalloc", // http://b/186825031, cc_library_static, depends on //bionic/libc:libc_common (http://b/186821517)
-
 		"libbionic_spawn_benchmark", // http://b/186824595, cc_library_static, depends on //external/google-benchmark (http://b/186822740)
 		//                                                                also depends on //system/logging/liblog:liblog (http://b/186822772)
 
@@ -180,11 +178,8 @@ var (
 		"liblinker_malloc", // http://b/186826466, cc_library_static, depends on //external/zlib:libz (http://b/186823782)
 		//                                                       also depends on //system/libziparchive:libziparchive (http://b/186823656)
 		//                                                       also depends on //system/logging/liblog:liblog (http://b/186822772)
-		"libc_jemalloc_wrapper", // http://b/187012490, cc_library_static, depends on //external/jemalloc_new:libjemalloc5 (http://b/186828626)
-		"libc_ndk",              // http://b/187013218, cc_library_static, depends on //bionic/libm:libm (http://b/183064661)
-		"libc",                  // http://b/183064430, cc_library, depends on //external/jemalloc_new:libjemalloc5 (http://b/186828626)
-		"libc_malloc_hooks",     // http://b/187016307, cc_library, ld.lld: error: undefined symbol: __malloc_hook
-		"libm",                  // http://b/183064661, cc_library, math.h:25:16: error: unexpected token in argument list
+		"libc_ndk",          // http://b/187013218, cc_library_static, depends on //bionic/libm:libm (http://b/183064661)
+		"libc_malloc_hooks", // http://b/187016307, cc_library, ld.lld: error: undefined symbol: __malloc_hook
 
 		// http://b/186823769: Needs C++ STL support, includes from unconverted standard libraries in //external/libcxx
 		// c++_static
@@ -193,7 +188,7 @@ var (
 		"libBionicBenchmarksUtils", // cc_library_static, fatal error: 'map' file not found, from libcxx
 		"fmtlib",                   // cc_library_static, fatal error: 'cassert' file not found, from libcxx
 		"fmtlib_ndk",               // cc_library_static, fatal error: 'cassert' file not found
-		"libbase",                  // http://b/186826479, cc_library, fatal error: 'memory' file not found, from libcxx
+		"libbase",                  // Requires liblog. http://b/186826479, cc_library, fatal error: 'memory' file not found, from libcxx.
 
 		// http://b/186024507: Includes errors because of the system_shared_libs default value.
 		// Missing -isystem bionic/libc/include through the libc/libm/libdl
@@ -204,7 +199,6 @@ var (
 		"note_memtag_heap_async", // http://b/185127353: cc_library_static, error: feature.h not found
 		"note_memtag_heap_sync",  // http://b/185127353: cc_library_static, error: feature.h not found
 
-		"libjemalloc5",           // cc_library, ld.lld: error: undefined symbol: memset
 		"gwp_asan_crash_handler", // cc_library, ld.lld: error: undefined symbol: memset
 
 		// Tests. Handle later.
@@ -217,24 +211,13 @@ var (
 	// Per-module denylist of cc_library modules to only generate the static
 	// variant if their shared variant isn't ready or buildable by Bazel.
 	bp2buildCcLibraryStaticOnlyList = []string{
-		"libstdc++", // http://b/186822597, cc_library, ld.lld: error: undefined symbol: __errno
+		"libstdc++",    // http://b/186822597, cc_library, ld.lld: error: undefined symbol: __errno
+		"libjemalloc5", // http://b/188503688, cc_library, `target: { android: { enabled: false } }` for android targets.
 	}
 
 	// Per-module denylist to opt modules out of mixed builds. Such modules will
 	// still be generated via bp2build.
-	mixedBuildsDisabledList = []string{
-		"libc_bionic_ndk",                  // cparsons@, http://b/183213331, Handle generated headers in mixed builds.
-		"libc_common",                      // cparsons@ cc_library_static, depends on //bionic/libc:libc_nopthread
-		"libc_common_static",               // cparsons@ cc_library_static, depends on //bionic/libc:libc_common
-		"libc_common_shared",               // cparsons@ cc_library_static, depends on //bionic/libc:libc_common
-		"libc_netbsd",                      // lberki@, cc_library_static, version script assignment of 'LIBC_PRIVATE' to symbol 'SHA1Final' failed: symbol not defined
-		"libc_nopthread",                   // cparsons@ cc_library_static, depends on //bionic/libc:libc_bionic_ndk
-		"libc_openbsd",                     // ruperts@, cc_library_static, OK for bp2build but error: duplicate symbol: strcpy for mixed builds
-		"libsystemproperties",              // cparsons@, cc_library_static, wrong include paths
-		"libpropertyinfoparser",            // cparsons@, cc_library_static, wrong include paths
-		"libarm-optimized-routines-string", // jingwen@, cc_library_static, OK for bp2build but b/186615213 (asflags not handled in  bp2build), version script assignment of 'LIBC' to symbol 'memcmp' failed: symbol not defined (also for memrchr, strnlen)
-		"fmtlib_ndk",                       // http://b/187040371, cc_library_static, OK for bp2build but format-inl.h:11:10: fatal error: 'cassert' file not found for mixed builds
-	}
+	mixedBuildsDisabledList = []string{}
 
 	// Used for quicker lookups
 	bp2buildModuleDoNotConvert  = map[string]bool{}

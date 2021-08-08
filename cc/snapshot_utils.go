@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	headerExts = []string{".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".inc", ".ipp", ".h.generic"}
+	HeaderExts = []string{".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".inc", ".ipp", ".h.generic"}
 )
 
 func (m *Module) IsSnapshotLibrary() bool {
@@ -51,6 +51,10 @@ func (m *Module) SnapshotRuntimeLibs() []string {
 
 func (m *Module) SnapshotSharedLibs() []string {
 	return m.Properties.SnapshotSharedLibs
+}
+
+func (m *Module) SnapshotStaticLibs() []string {
+	return m.Properties.SnapshotStaticLibs
 }
 
 // snapshotLibraryInterface is an interface for libraries captured to VNDK / vendor snapshots.
@@ -109,7 +113,7 @@ func ShouldCollectHeadersForSnapshot(ctx android.ModuleContext, m LinkableInterf
 		return ctx.Config().VndkSnapshotBuildArtifacts()
 	}
 
-	for _, image := range []snapshotImage{vendorSnapshotImageSingleton, recoverySnapshotImageSingleton} {
+	for _, image := range []SnapshotImage{VendorSnapshotImageSingleton, recoverySnapshotImageSingleton} {
 		if isSnapshotAware(ctx.DeviceConfig(), m, image.isProprietaryPath(ctx.ModuleDir(), ctx.DeviceConfig()), apexInfo, image) {
 			return true
 		}

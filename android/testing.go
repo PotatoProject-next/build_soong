@@ -110,6 +110,11 @@ var PrepareForTestWithLicenseDefaultModules = GroupFixturePreparers(
 	FixtureAddFile("build/soong/licenses/LICENSE", nil),
 )
 
+var PrepareForTestWithNamespace = FixtureRegisterWithContext(func(ctx RegistrationContext) {
+	registerNamespaceBuildComponents(ctx)
+	ctx.PreArchMutators(RegisterNamespaceMutator)
+})
+
 // Test fixture preparer that will register most java build components.
 //
 // Singletons and mutators should only be added here if they are needed for a majority of java
@@ -713,9 +718,11 @@ func (b baseTestingComponent) newTestingBuildParams(bparams BuildParams) Testing
 
 func (b baseTestingComponent) maybeBuildParamsFromRule(rule string) (TestingBuildParams, []string) {
 	var searchedRules []string
-	for _, p := range b.provider.BuildParamsForTests() {
-		searchedRules = append(searchedRules, p.Rule.String())
-		if strings.Contains(p.Rule.String(), rule) {
+	buildParams := b.provider.BuildParamsForTests()
+	for _, p := range buildParams {
+		ruleAsString := p.Rule.String()
+		searchedRules = append(searchedRules, ruleAsString)
+		if strings.Contains(ruleAsString, rule) {
 			return b.newTestingBuildParams(p), searchedRules
 		}
 	}
@@ -725,7 +732,7 @@ func (b baseTestingComponent) maybeBuildParamsFromRule(rule string) (TestingBuil
 func (b baseTestingComponent) buildParamsFromRule(rule string) TestingBuildParams {
 	p, searchRules := b.maybeBuildParamsFromRule(rule)
 	if p.Rule == nil {
-		panic(fmt.Errorf("couldn't find rule %q.\nall rules: %v", rule, searchRules))
+		panic(fmt.Errorf("couldn't find rule %q.\nall rules:\n%s", rule, strings.Join(searchRules, "\n")))
 	}
 	return p
 }

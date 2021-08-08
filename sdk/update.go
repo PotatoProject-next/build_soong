@@ -22,7 +22,6 @@ import (
 
 	"android/soong/apex"
 	"android/soong/cc"
-
 	"github.com/google/blueprint"
 	"github.com/google/blueprint/proptools"
 
@@ -35,6 +34,20 @@ import (
 // SOONG_SDK_SNAPSHOT_PREFER
 //     By default every unversioned module in the generated snapshot has prefer: false. Building it
 //     with SOONG_SDK_SNAPSHOT_PREFER=true will force them to use prefer: true.
+//
+// SOONG_SDK_SNAPSHOT_VERSION
+//     This provides control over the version of the generated snapshot.
+//
+//     SOONG_SDK_SNAPSHOT_VERSION=current will generate unversioned and versioned prebuilts and a
+//     versioned snapshot module. This is the default behavior. The zip file containing the
+//     generated snapshot will be <sdk-name>-current.zip.
+//
+//     SOONG_SDK_SNAPSHOT_VERSION=unversioned will generate unversioned prebuilts only and the zip
+//     file containing the generated snapshot will be <sdk-name>.zip.
+//
+//     SOONG_SDK_SNAPSHOT_VERSION=<number> will generate versioned prebuilts and a versioned
+//     snapshot module only. The zip file containing the generated snapshot will be
+//     <sdk-name>-<number>.zip.
 //
 
 var pctx = android.NewPackageContext("android/soong/sdk")
@@ -69,6 +82,11 @@ var (
 		})
 )
 
+const (
+	soongSdkSnapshotVersionUnversioned = "unversioned"
+	soongSdkSnapshotVersionCurrent     = "current"
+)
+
 type generatedContents struct {
 	content     strings.Builder
 	indentLevel int
@@ -95,8 +113,16 @@ func (gc *generatedContents) Dedent() {
 	gc.indentLevel--
 }
 
-func (gc *generatedContents) Printfln(format string, args ...interface{}) {
-	fmt.Fprintf(&(gc.content), strings.Repeat("    ", gc.indentLevel)+format+"\n", args...)
+// IndentedPrintf will add spaces to indent the line to the appropriate level before printing the
+// arguments.
+func (gc *generatedContents) IndentedPrintf(format string, args ...interface{}) {
+	fmt.Fprintf(&(gc.content), strings.Repeat("    ", gc.indentLevel)+format, args...)
+}
+
+// UnindentedPrintf does not add spaces to indent the line to the appropriate level before printing
+// the arguments.
+func (gc *generatedContents) UnindentedPrintf(format string, args ...interface{}) {
+	fmt.Fprintf(&(gc.content), format, args...)
 }
 
 func (gf *generatedFile) build(pctx android.PackageContext, ctx android.BuilderContext, implicits android.Paths) {
@@ -121,14 +147,19 @@ func (gf *generatedFile) build(pctx android.PackageContext, ctx android.BuilderC
 
 // Collect all the members.
 //
-// Updates the sdk module with a list of sdkMemberVariantDeps and details as to which multilibs
-// (32/64/both) are used by this sdk variant.
+// Updates the sdk module with a list of sdkMemberVariantDep instances and details as to which
+// multilibs (32/64/both) are used by this sdk variant.
 func (s *sdk) collectMembers(ctx android.ModuleContext) {
 	s.multilibUsages = multilibNone
 	ctx.WalkDeps(func(child android.Module, parent android.Module) bool {
 		tag := ctx.OtherModuleDependencyTag(child)
 		if memberTag, ok := tag.(android.SdkMemberTypeDependencyTag); ok {
 			memberType := memberTag.SdkMemberType(child)
+
+			// If a nil SdkMemberType was returned then this module should not be added to the sdk.
+			if memberType == nil {
+				return false
+			}
 
 			// Make sure that the resolved module is allowed in the member list property.
 			if !memberType.IsInstance(child) {
@@ -138,8 +169,15 @@ func (s *sdk) collectMembers(ctx android.ModuleContext) {
 			// Keep track of which multilib variants are used by the sdk.
 			s.multilibUsages = s.multilibUsages.addArchType(child.Target().Arch.ArchType)
 
+			var exportedComponentsInfo android.ExportedComponentsInfo
+			if ctx.OtherModuleHasProvider(child, android.ExportedComponentsInfoProvider) {
+				exportedComponentsInfo = ctx.OtherModuleProvider(child, android.ExportedComponentsInfoProvider).(android.ExportedComponentsInfo)
+			}
+
 			export := memberTag.ExportMember()
-			s.memberVariantDeps = append(s.memberVariantDeps, sdkMemberVariantDep{s, memberType, child.(android.SdkAware), export})
+			s.memberVariantDeps = append(s.memberVariantDeps, sdkMemberVariantDep{
+				s, memberType, child.(android.SdkAware), export, exportedComponentsInfo,
+			})
 
 			// Recurse down into the member's dependencies as it may have dependencies that need to be
 			// automatically added to the sdk.
@@ -226,26 +264,41 @@ func versionedSdkMemberName(ctx android.ModuleContext, memberName string, versio
 // the contents (header files, stub libraries, etc) into the zip file.
 func (s *sdk) buildSnapshot(ctx android.ModuleContext, sdkVariants []*sdk) android.OutputPath {
 
-	allMembersByName := make(map[string]struct{})
-	exportedMembersByName := make(map[string]struct{})
+	// Aggregate all the sdkMemberVariantDep instances from all the sdk variants.
 	hasLicenses := false
 	var memberVariantDeps []sdkMemberVariantDep
 	for _, sdkVariant := range sdkVariants {
 		memberVariantDeps = append(memberVariantDeps, sdkVariant.memberVariantDeps...)
+	}
 
-		// Record the names of all the members, both explicitly specified and implicitly
-		// included.
-		for _, memberVariantDep := range sdkVariant.memberVariantDeps {
-			name := memberVariantDep.variant.Name()
-			allMembersByName[name] = struct{}{}
+	// Filter out any sdkMemberVariantDep that is a component of another.
+	memberVariantDeps = filterOutComponents(ctx, memberVariantDeps)
 
-			if memberVariantDep.export {
-				exportedMembersByName[name] = struct{}{}
-			}
+	// Record the names of all the members, both explicitly specified and implicitly
+	// included.
+	allMembersByName := make(map[string]struct{})
+	exportedMembersByName := make(map[string]struct{})
 
-			if memberVariantDep.memberType == android.LicenseModuleSdkMemberType {
-				hasLicenses = true
-			}
+	addMember := func(name string, export bool) {
+		allMembersByName[name] = struct{}{}
+		if export {
+			exportedMembersByName[name] = struct{}{}
+		}
+	}
+
+	for _, memberVariantDep := range memberVariantDeps {
+		name := memberVariantDep.variant.Name()
+		export := memberVariantDep.export
+
+		addMember(name, export)
+
+		// Add any components provided by the module.
+		for _, component := range memberVariantDep.exportedComponentsInfo.Components {
+			addMember(component, export)
+		}
+
+		if memberVariantDep.memberType == android.LicenseModuleSdkMemberType {
+			hasLicenses = true
 		}
 	}
 
@@ -257,10 +310,26 @@ func (s *sdk) buildSnapshot(ctx android.ModuleContext, sdkVariants []*sdk) andro
 		modules: make(map[string]*bpModule),
 	}
 
+	config := ctx.Config()
+	version := config.GetenvWithDefault("SOONG_SDK_SNAPSHOT_VERSION", "current")
+
+	// Generate versioned modules in the snapshot unless an unversioned snapshot has been requested.
+	generateVersioned := version != soongSdkSnapshotVersionUnversioned
+
+	// Generate unversioned modules in the snapshot unless a numbered snapshot has been requested.
+	//
+	// Unversioned modules are not required in that case because the numbered version will be a
+	// finalized version of the snapshot that is intended to be kept separate from the
+	generateUnversioned := version == soongSdkSnapshotVersionUnversioned || version == soongSdkSnapshotVersionCurrent
+	snapshotZipFileSuffix := ""
+	if generateVersioned {
+		snapshotZipFileSuffix = "-" + version
+	}
+
 	builder := &snapshotBuilder{
 		ctx:                   ctx,
 		sdk:                   s,
-		version:               "current",
+		version:               version,
 		snapshotDir:           snapshotDir.OutputPath,
 		copies:                make(map[string]string),
 		filesToZip:            []android.Path{bp.path},
@@ -314,20 +383,26 @@ be unnecessary as every module in the sdk already has its own licenses property.
 		// Prune any empty property sets.
 		unversioned = unversioned.transform(pruneEmptySetTransformer{})
 
-		// Copy the unversioned module so it can be modified to make it versioned.
-		versioned := unversioned.deepCopy()
+		if generateVersioned {
+			// Copy the unversioned module so it can be modified to make it versioned.
+			versioned := unversioned.deepCopy()
 
-		// Transform the unversioned module into a versioned one.
-		versioned.transform(unversionedToVersionedTransformer)
-		bpFile.AddModule(versioned)
+			// Transform the unversioned module into a versioned one.
+			versioned.transform(unversionedToVersionedTransformer)
+			bpFile.AddModule(versioned)
+		}
 
-		// Transform the unversioned module to make it suitable for use in the snapshot.
-		unversioned.transform(unversionedTransformer)
-		bpFile.AddModule(unversioned)
+		if generateUnversioned {
+			// Transform the unversioned module to make it suitable for use in the snapshot.
+			unversioned.transform(unversionedTransformer)
+			bpFile.AddModule(unversioned)
+		}
 	}
 
-	// Add the sdk/module_exports_snapshot module to the bp file.
-	s.addSnapshotModule(ctx, builder, sdkVariants, memberVariantDeps)
+	if generateVersioned {
+		// Add the sdk/module_exports_snapshot module to the bp file.
+		s.addSnapshotModule(ctx, builder, sdkVariants, memberVariantDeps)
+	}
 
 	// generate Android.bp
 	bp = newGeneratedFile(ctx, "snapshot", "Android.bp")
@@ -341,7 +416,8 @@ be unnecessary as every module in the sdk already has its own licenses property.
 	filesToZip := builder.filesToZip
 
 	// zip them all
-	outputZipFile := android.PathForModuleOut(ctx, ctx.ModuleName()+"-current.zip").OutputPath
+	zipPath := fmt.Sprintf("%s%s.zip", ctx.ModuleName(), snapshotZipFileSuffix)
+	outputZipFile := android.PathForModuleOut(ctx, zipPath).OutputPath
 	outputDesc := "Building snapshot for " + ctx.ModuleName()
 
 	// If there are no zips to merge then generate the output zip directly.
@@ -353,7 +429,8 @@ be unnecessary as every module in the sdk already has its own licenses property.
 		zipFile = outputZipFile
 		desc = outputDesc
 	} else {
-		zipFile = android.PathForModuleOut(ctx, ctx.ModuleName()+"-current.unmerged.zip").OutputPath
+		intermediatePath := fmt.Sprintf("%s%s.unmerged.zip", ctx.ModuleName(), snapshotZipFileSuffix)
+		zipFile = android.PathForModuleOut(ctx, intermediatePath).OutputPath
 		desc = "Building intermediate snapshot for " + ctx.ModuleName()
 	}
 
@@ -378,6 +455,47 @@ be unnecessary as every module in the sdk already has its own licenses property.
 	}
 
 	return outputZipFile
+}
+
+// filterOutComponents removes any item from the deps list that is a component of another item in
+// the deps list, e.g. if the deps list contains "foo" and "foo.stubs" which is component of "foo"
+// then it will remove "foo.stubs" from the deps.
+func filterOutComponents(ctx android.ModuleContext, deps []sdkMemberVariantDep) []sdkMemberVariantDep {
+	// Collate the set of components that all the modules added to the sdk provide.
+	components := map[string]*sdkMemberVariantDep{}
+	for i, _ := range deps {
+		dep := &deps[i]
+		for _, c := range dep.exportedComponentsInfo.Components {
+			components[c] = dep
+		}
+	}
+
+	// If no module provides components then return the input deps unfiltered.
+	if len(components) == 0 {
+		return deps
+	}
+
+	filtered := make([]sdkMemberVariantDep, 0, len(deps))
+	for _, dep := range deps {
+		name := android.RemoveOptionalPrebuiltPrefix(ctx.OtherModuleName(dep.variant))
+		if owner, ok := components[name]; ok {
+			// This is a component of another module that is a member of the sdk.
+
+			// If the component is exported but the owning module is not then the configuration is not
+			// supported.
+			if dep.export && !owner.export {
+				ctx.ModuleErrorf("Module %s is internal to the SDK but provides component %s which is used outside the SDK")
+				continue
+			}
+
+			// This module must not be added to the list of members of the sdk as that would result in a
+			// duplicate module in the sdk snapshot.
+			continue
+		}
+
+		filtered = append(filtered, dep)
+	}
+	return filtered
 }
 
 // addSnapshotModule adds the sdk_snapshot/module_exports_snapshot module to the builder.
@@ -699,13 +817,13 @@ func generateBpContents(contents *generatedContents, bpFile *bpFile) {
 }
 
 func generateFilteredBpContents(contents *generatedContents, bpFile *bpFile, moduleFilter func(module *bpModule) bool) {
-	contents.Printfln("// This is auto-generated. DO NOT EDIT.")
+	contents.IndentedPrintf("// This is auto-generated. DO NOT EDIT.\n")
 	for _, bpModule := range bpFile.order {
 		if moduleFilter(bpModule) {
-			contents.Printfln("")
-			contents.Printfln("%s {", bpModule.moduleType)
+			contents.IndentedPrintf("\n")
+			contents.IndentedPrintf("%s {\n", bpModule.moduleType)
 			outputPropertySet(contents, bpModule.bpPropertySet)
-			contents.Printfln("}")
+			contents.IndentedPrintf("}\n")
 		}
 	}
 }
@@ -716,7 +834,7 @@ func outputPropertySet(contents *generatedContents, set *bpPropertySet) {
 	addComment := func(name string) {
 		if text, ok := set.comments[name]; ok {
 			for _, line := range strings.Split(text, "\n") {
-				contents.Printfln("// %s", line)
+				contents.IndentedPrintf("// %s\n", line)
 			}
 		}
 	}
@@ -733,29 +851,8 @@ func outputPropertySet(contents *generatedContents, set *bpPropertySet) {
 		}
 
 		addComment(name)
-		switch v := value.(type) {
-		case []string:
-			length := len(v)
-			if length > 1 {
-				contents.Printfln("%s: [", name)
-				contents.Indent()
-				for i := 0; i < length; i = i + 1 {
-					contents.Printfln("%q,", v[i])
-				}
-				contents.Dedent()
-				contents.Printfln("],")
-			} else if length == 0 {
-				contents.Printfln("%s: [],", name)
-			} else {
-				contents.Printfln("%s: [%q],", name, v[0])
-			}
-
-		case bool:
-			contents.Printfln("%s: %t,", name, v)
-
-		default:
-			contents.Printfln("%s: %q,", name, value)
-		}
+		reflectValue := reflect.ValueOf(value)
+		outputNamedValue(contents, name, reflectValue)
 	}
 
 	for _, name := range set.order {
@@ -765,13 +862,92 @@ func outputPropertySet(contents *generatedContents, set *bpPropertySet) {
 		switch v := value.(type) {
 		case *bpPropertySet:
 			addComment(name)
-			contents.Printfln("%s: {", name)
+			contents.IndentedPrintf("%s: {\n", name)
 			outputPropertySet(contents, v)
-			contents.Printfln("},")
+			contents.IndentedPrintf("},\n")
 		}
 	}
 
 	contents.Dedent()
+}
+
+// outputNamedValue outputs a value that has an associated name. The name will be indented, followed
+// by the value and then followed by a , and a newline.
+func outputNamedValue(contents *generatedContents, name string, value reflect.Value) {
+	contents.IndentedPrintf("%s: ", name)
+	outputUnnamedValue(contents, value)
+	contents.UnindentedPrintf(",\n")
+}
+
+// outputUnnamedValue outputs a single value. The value is not indented and is not followed by
+// either a , or a newline. With multi-line values, e.g. slices, all but the first line will be
+// indented and all but the last line will end with a newline.
+func outputUnnamedValue(contents *generatedContents, value reflect.Value) {
+	valueType := value.Type()
+	switch valueType.Kind() {
+	case reflect.Bool:
+		contents.UnindentedPrintf("%t", value.Bool())
+
+	case reflect.String:
+		contents.UnindentedPrintf("%q", value)
+
+	case reflect.Ptr:
+		outputUnnamedValue(contents, value.Elem())
+
+	case reflect.Slice:
+		length := value.Len()
+		if length == 0 {
+			contents.UnindentedPrintf("[]")
+		} else {
+			firstValue := value.Index(0)
+			if length == 1 && !multiLineValue(firstValue) {
+				contents.UnindentedPrintf("[")
+				outputUnnamedValue(contents, firstValue)
+				contents.UnindentedPrintf("]")
+			} else {
+				contents.UnindentedPrintf("[\n")
+				contents.Indent()
+				for i := 0; i < length; i++ {
+					itemValue := value.Index(i)
+					contents.IndentedPrintf("")
+					outputUnnamedValue(contents, itemValue)
+					contents.UnindentedPrintf(",\n")
+				}
+				contents.Dedent()
+				contents.IndentedPrintf("]")
+			}
+		}
+
+	case reflect.Struct:
+		// Avoid unlimited recursion by requiring every structure to implement android.BpPrintable.
+		v := value.Interface()
+		if _, ok := v.(android.BpPrintable); !ok {
+			panic(fmt.Errorf("property value %#v of type %T does not implement android.BpPrintable", v, v))
+		}
+		contents.UnindentedPrintf("{\n")
+		contents.Indent()
+		for f := 0; f < valueType.NumField(); f++ {
+			fieldType := valueType.Field(f)
+			if fieldType.Anonymous {
+				continue
+			}
+			fieldValue := value.Field(f)
+			fieldName := fieldType.Name
+			propertyName := proptools.PropertyNameForField(fieldName)
+			outputNamedValue(contents, propertyName, fieldValue)
+		}
+		contents.Dedent()
+		contents.IndentedPrintf("}")
+
+	default:
+		panic(fmt.Errorf("Unknown type: %T of value %#v", value, value))
+	}
+}
+
+// multiLineValue returns true if the supplied value may require multiple lines in the output.
+func multiLineValue(value reflect.Value) bool {
+	kind := value.Kind()
+	return kind == reflect.Slice || kind == reflect.Struct
 }
 
 func (s *sdk) GetAndroidBpContentsForTests() string {
@@ -801,9 +977,15 @@ func (s *sdk) GetVersionedAndroidBpContentsForTests() string {
 }
 
 type snapshotBuilder struct {
-	ctx         android.ModuleContext
-	sdk         *sdk
-	version     string
+	ctx android.ModuleContext
+	sdk *sdk
+
+	// The version of the generated snapshot.
+	//
+	// See the documentation of SOONG_SDK_SNAPSHOT_VERSION above for details of the valid values of
+	// this field.
+	version string
+
 	snapshotDir android.OutputPath
 	bpFile      *bpFile
 
@@ -1037,9 +1219,18 @@ func addSdkMemberPropertiesToSet(ctx *memberContext, memberProperties android.Sd
 type sdkMemberVariantDep struct {
 	// The sdk variant that depends (possibly indirectly) on the member variant.
 	sdkVariant *sdk
+
+	// The type of sdk member the variant is to be treated as.
 	memberType android.SdkMemberType
-	variant    android.SdkAware
-	export     bool
+
+	// The variant that is added to the sdk.
+	variant android.SdkAware
+
+	// True if the member should be exported, i.e. accessible, from outside the sdk.
+	export bool
+
+	// The names of additional component modules provided by the variant.
+	exportedComponentsInfo android.ExportedComponentsInfo
 }
 
 var _ android.SdkMember = (*sdkMember)(nil)

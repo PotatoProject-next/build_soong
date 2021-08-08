@@ -31,7 +31,7 @@ var vendorSnapshotSingleton = snapshotSingleton{
 	"SOONG_VENDOR_SNAPSHOT_ZIP",
 	android.OptionalPath{},
 	true,
-	vendorSnapshotImageSingleton,
+	VendorSnapshotImageSingleton,
 	false, /* fake */
 }
 
@@ -40,7 +40,7 @@ var vendorFakeSnapshotSingleton = snapshotSingleton{
 	"SOONG_VENDOR_FAKE_SNAPSHOT_ZIP",
 	android.OptionalPath{},
 	true,
-	vendorSnapshotImageSingleton,
+	VendorSnapshotImageSingleton,
 	true, /* fake */
 }
 
@@ -82,7 +82,7 @@ type snapshotSingleton struct {
 	// Implementation of the image interface specific to the image
 	// associated with this snapshot (e.g., specific to the vendor image,
 	// recovery image, etc.).
-	image snapshotImage
+	image SnapshotImage
 
 	// Whether this singleton is for fake snapshot or not.
 	// Fake snapshot is a snapshot whose prebuilt binaries and headers are empty.
@@ -104,7 +104,7 @@ func isRecoveryProprietaryPath(dir string, deviceConfig android.DeviceConfig) bo
 	return RecoverySnapshotSingleton().(*snapshotSingleton).image.isProprietaryPath(dir, deviceConfig)
 }
 
-func isVendorProprietaryModule(ctx android.BaseModuleContext) bool {
+func IsVendorProprietaryModule(ctx android.BaseModuleContext) bool {
 	// Any module in a vendor proprietary path is a vendor proprietary
 	// module.
 	if isVendorProprietaryPath(ctx.ModuleDir(), ctx.DeviceConfig()) {
@@ -147,7 +147,7 @@ func isRecoveryProprietaryModule(ctx android.BaseModuleContext) bool {
 }
 
 // Determines if the module is a candidate for snapshot.
-func isSnapshotAware(cfg android.DeviceConfig, m LinkableInterface, inProprietaryPath bool, apexInfo android.ApexInfo, image snapshotImage) bool {
+func isSnapshotAware(cfg android.DeviceConfig, m LinkableInterface, inProprietaryPath bool, apexInfo android.ApexInfo, image SnapshotImage) bool {
 	if !m.Enabled() || m.HiddenFromMake() {
 		return false
 	}
@@ -205,7 +205,7 @@ func isSnapshotAware(cfg android.DeviceConfig, m LinkableInterface, inProprietar
 		if sanitizable.Static() {
 			return sanitizable.OutputFile().Valid() && !image.private(m)
 		}
-		if sanitizable.Shared() {
+		if sanitizable.Shared() || sanitizable.Rlib() {
 			if !sanitizable.OutputFile().Valid() {
 				return false
 			}
@@ -242,10 +242,12 @@ type snapshotJsonFlags struct {
 	SanitizeUbsanDep   bool     `json:",omitempty"`
 
 	// binary flags
-	Symlinks []string `json:",omitempty"`
+	Symlinks         []string `json:",omitempty"`
+	StaticExecutable bool     `json:",omitempty"`
 
 	// dependencies
 	SharedLibs  []string `json:",omitempty"`
+	StaticLibs  []string `json:",omitempty"`
 	RuntimeLibs []string `json:",omitempty"`
 	Required    []string `json:",omitempty"`
 
@@ -381,6 +383,8 @@ func (c *snapshotSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 			if m.Shared() {
 				prop.SharedLibs = m.SnapshotSharedLibs()
 			}
+			// static libs dependencies are required to collect the NOTICE files.
+			prop.StaticLibs = m.SnapshotStaticLibs()
 			if sanitizable, ok := m.(PlatformSanitizeable); ok {
 				if sanitizable.Static() && sanitizable.SanitizePropDefined() {
 					prop.SanitizeMinimalDep = sanitizable.MinimalRuntimeDep() || sanitizable.MinimalRuntimeNeeded()
@@ -393,6 +397,8 @@ func (c *snapshotSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 				libType = "static"
 			} else if m.Shared() {
 				libType = "shared"
+			} else if m.Rlib() {
+				libType = "rlib"
 			} else {
 				libType = "header"
 			}
@@ -404,7 +410,7 @@ func (c *snapshotSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 				libPath := m.OutputFile().Path()
 				stem = libPath.Base()
 				if sanitizable, ok := m.(PlatformSanitizeable); ok {
-					if sanitizable.Static() && sanitizable.SanitizePropDefined() && sanitizable.IsSanitizerEnabled(cfi) {
+					if (sanitizable.Static() || sanitizable.Rlib()) && sanitizable.SanitizePropDefined() && sanitizable.IsSanitizerEnabled(cfi) {
 						// both cfi and non-cfi variant for static libraries can exist.
 						// attach .cfi to distinguish between cfi and non-cfi.
 						// e.g. libbase.a -> libbase.cfi.a
@@ -424,8 +430,10 @@ func (c *snapshotSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 		} else if m.Binary() {
 			// binary flags
 			prop.Symlinks = m.Symlinks()
+			prop.StaticExecutable = m.StaticExecutable()
 			prop.SharedLibs = m.SnapshotSharedLibs()
-
+			// static libs dependencies are required to collect the NOTICE files.
+			prop.StaticLibs = m.SnapshotStaticLibs()
 			// install bin
 			binPath := m.OutputFile().Path()
 			snapshotBinOut := filepath.Join(snapshotArchDir, targetArch, "binary", binPath.Base())
@@ -493,13 +501,13 @@ func (c *snapshotSingleton) GenerateBuildActions(ctx android.SingletonContext) {
 			headers = append(headers, m.SnapshotHeaders()...)
 		}
 
-		if len(m.NoticeFiles()) > 0 {
+		if len(m.EffectiveLicenseFiles()) > 0 {
 			noticeName := ctx.ModuleName(m) + ".txt"
 			noticeOut := filepath.Join(noticeDir, noticeName)
 			// skip already copied notice file
 			if !installedNotices[noticeOut] {
 				installedNotices[noticeOut] = true
-				snapshotOutputs = append(snapshotOutputs, combineNoticesRule(ctx, m.NoticeFiles(), noticeOut))
+				snapshotOutputs = append(snapshotOutputs, combineNoticesRule(ctx, m.EffectiveLicenseFiles(), noticeOut))
 			}
 		}
 	})

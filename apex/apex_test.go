@@ -374,7 +374,6 @@ func TestBasicApex(t *testing.T) {
 			symlinks: ["foo_link_"],
 			symlink_preferred_arch: true,
 			system_shared_libs: [],
-			static_executable: true,
 			stl: "none",
 			apex_available: [ "myapex", "com.android.gki.*" ],
 		}
@@ -1875,6 +1874,45 @@ func TestApexMinSdkVersion_DefaultsToLatest(t *testing.T) {
 	expectNoLink("libx", "shared_apex10000", "libz", "shared")
 }
 
+func TestApexMinSdkVersion_crtobjectInVendorApex(t *testing.T) {
+	ctx := testApex(t, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			native_shared_libs: ["mylib"],
+			updatable: false,
+			vendor: true,
+			min_sdk_version: "29",
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+
+		cc_library {
+			name: "mylib",
+			vendor_available: true,
+			system_shared_libs: [],
+			stl: "none",
+			apex_available: [ "myapex" ],
+			min_sdk_version: "29",
+		}
+	`)
+
+	vendorVariant := "android_vendor.29_arm64_armv8-a"
+
+	// First check that the correct variant of crtbegin_so is used.
+	ldRule := ctx.ModuleForTests("mylib", vendorVariant+"_shared_apex29").Rule("ld")
+	crtBegin := names(ldRule.Args["crtBegin"])
+	ensureListContains(t, crtBegin, "out/soong/.intermediates/"+cc.DefaultCcCommonTestModulesDir+"crtbegin_so/"+vendorVariant+"_apex29/crtbegin_so.o")
+
+	// Ensure that the crtbegin_so used by the APEX is targeting 29
+	cflags := ctx.ModuleForTests("crtbegin_so", vendorVariant+"_apex29").Rule("cc").Args["cFlags"]
+	android.AssertStringDoesContain(t, "cflags", cflags, "-target aarch64-linux-android29")
+}
+
 func TestPlatformUsesLatestStubsFromApexes(t *testing.T) {
 	ctx := testApex(t, `
 		apex {
@@ -2494,7 +2532,6 @@ func TestFilesInSubDir(t *testing.T) {
 			srcs: ["mylib.cpp"],
 			relative_install_path: "foo/bar",
 			system_shared_libs: [],
-			static_executable: true,
 			stl: "none",
 			apex_available: [ "myapex" ],
 		}
@@ -2554,7 +2591,6 @@ func TestFilesInSubDirWhenNativeBridgeEnabled(t *testing.T) {
 			name: "mybin",
 			relative_install_path: "foo/bar",
 			system_shared_libs: [],
-			static_executable: true,
 			stl: "none",
 			apex_available: [ "myapex" ],
 			native_bridge_supported: true,
@@ -4666,7 +4702,15 @@ func TestPrebuiltApexNameWithPlatformBootclasspath(t *testing.T) {
 
 			prebuilt_bootclasspath_fragment {
 				name: "art-bootclasspath-fragment",
+				image_name: "art",
 				contents: ["core-oj"],
+				hidden_api: {
+					annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+					metadata: "my-bootclasspath-fragment/metadata.csv",
+					index: "my-bootclasspath-fragment/index.csv",
+					stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+					all_flags: "my-bootclasspath-fragment/all-flags.csv",
+				},
 			}
 
 			java_import {
@@ -4867,7 +4911,7 @@ func TestPrebuiltExportDexImplementationJars(t *testing.T) {
 
 func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 	preparer := android.GroupFixturePreparers(
-		java.FixtureConfigureBootJars("myapex:libfoo", "myapex:libbar"),
+		java.FixtureConfigureApexBootJars("myapex:libfoo", "myapex:libbar"),
 		// Make sure that the frameworks/base/Android.bp file exists as otherwise hidden API encoding
 		// is disabled.
 		android.FixtureAddTextFile("frameworks/base/Android.bp", ""),
@@ -4886,17 +4930,26 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			}
 		}
 		if !foundLibfooJar {
-			t.Errorf("Rule for libfoo.jar missing in dex_bootjars singleton outputs %q", android.StringPathsRelativeToTop(ctx.Config().BuildDir(), s.AllOutputs()))
+			t.Errorf("Rule for libfoo.jar missing in dex_bootjars singleton outputs %q", android.StringPathsRelativeToTop(ctx.Config().SoongOutDir(), s.AllOutputs()))
 		}
 	}
 
-	checkHiddenAPIIndexInputs := func(t *testing.T, ctx *android.TestContext, expectedIntermediateInputs string) {
+	checkHiddenAPIIndexFromClassesInputs := func(t *testing.T, ctx *android.TestContext, expectedIntermediateInputs string) {
 		t.Helper()
 		platformBootclasspath := ctx.ModuleForTests("platform-bootclasspath", "android_common")
 		var rule android.TestingBuildParams
 
 		rule = platformBootclasspath.Output("hiddenapi-monolithic/index-from-classes.csv")
 		java.CheckHiddenAPIRuleInputs(t, "intermediate index", expectedIntermediateInputs, rule)
+	}
+
+	checkHiddenAPIIndexFromFlagsInputs := func(t *testing.T, ctx *android.TestContext, expectedIntermediateInputs string) {
+		t.Helper()
+		platformBootclasspath := ctx.ModuleForTests("platform-bootclasspath", "android_common")
+		var rule android.TestingBuildParams
+
+		rule = platformBootclasspath.Output("hiddenapi-index.csv")
+		java.CheckHiddenAPIRuleInputs(t, "monolithic index", expectedIntermediateInputs, rule)
 	}
 
 	fragment := java.ApexVariantReference{
@@ -4923,12 +4976,20 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
 			name: "libfoo",
 			jars: ["libfoo.jar"],
 			apex_available: ["myapex"],
+			permitted_packages: ["foo"],
 		}
 
 		java_sdk_library_import {
@@ -4938,6 +4999,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			},
 			apex_available: ["myapex"],
 			shared_library: false,
+			permitted_packages: ["bar"],
 		}
 	`
 
@@ -4946,9 +5008,10 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		checkBootDexJarPath(t, ctx, "libbar", "out/soong/.intermediates/myapex.deapexer/android_common/deapexer/javalib/libbar.jar")
 
 		// Verify the correct module jars contribute to the hiddenapi index file.
-		checkHiddenAPIIndexInputs(t, ctx, `
-			out/soong/.intermediates/libbar.stubs/android_common/combined/libbar.stubs.jar
-			out/soong/.intermediates/libfoo/android_common_myapex/combined/libfoo.jar
+		checkHiddenAPIIndexFromClassesInputs(t, ctx, ``)
+		checkHiddenAPIIndexFromFlagsInputs(t, ctx, `
+			my-bootclasspath-fragment/index.csv
+			out/soong/.intermediates/frameworks/base/boot/platform-bootclasspath/android_common/hiddenapi-monolithic/index-from-classes.csv
 		`)
 	})
 
@@ -4964,12 +5027,20 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
 			name: "libfoo",
 			jars: ["libfoo.jar"],
 			apex_available: ["myapex"],
+			permitted_packages: ["foo"],
 		}
 
 		java_sdk_library_import {
@@ -4979,6 +5050,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			},
 			apex_available: ["myapex"],
 			shared_library: false,
+			permitted_packages: ["bar"],
 		}
 	`
 
@@ -4987,9 +5059,10 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		checkBootDexJarPath(t, ctx, "libbar", "out/soong/.intermediates/myapex.deapexer/android_common/deapexer/javalib/libbar.jar")
 
 		// Verify the correct module jars contribute to the hiddenapi index file.
-		checkHiddenAPIIndexInputs(t, ctx, `
-			out/soong/.intermediates/libbar.stubs/android_common/combined/libbar.stubs.jar
-			out/soong/.intermediates/libfoo/android_common_myapex/combined/libfoo.jar
+		checkHiddenAPIIndexFromClassesInputs(t, ctx, ``)
+		checkHiddenAPIIndexFromFlagsInputs(t, ctx, `
+			my-bootclasspath-fragment/index.csv
+			out/soong/.intermediates/frameworks/base/boot/platform-bootclasspath/android_common/hiddenapi-monolithic/index-from-classes.csv
 		`)
 	})
 
@@ -5012,6 +5085,13 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
@@ -5049,6 +5129,12 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		// find the dex boot jar in it. We either need to disable the source libfoo
 		// or make the prebuilt libfoo preferred.
 		testDexpreoptWithApexes(t, bp, "module libfoo does not provide a dex boot jar", preparer, fragment)
+		// dexbootjar check is skipped if AllowMissingDependencies is true
+		preparerAllowMissingDeps := android.GroupFixturePreparers(
+			preparer,
+			android.PrepareForTestWithAllowMissingDependencies,
+		)
+		testDexpreoptWithApexes(t, bp, "", preparerAllowMissingDeps, fragment)
 	})
 
 	t.Run("prebuilt library preferred with source", func(t *testing.T) {
@@ -5070,6 +5156,13 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
@@ -5077,6 +5170,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			prefer: true,
 			jars: ["libfoo.jar"],
 			apex_available: ["myapex"],
+			permitted_packages: ["foo"],
 		}
 
 		java_library {
@@ -5093,6 +5187,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			},
 			apex_available: ["myapex"],
 			shared_library: false,
+			permitted_packages: ["bar"],
 		}
 
 		java_sdk_library {
@@ -5108,9 +5203,10 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		checkBootDexJarPath(t, ctx, "libbar", "out/soong/.intermediates/myapex.deapexer/android_common/deapexer/javalib/libbar.jar")
 
 		// Verify the correct module jars contribute to the hiddenapi index file.
-		checkHiddenAPIIndexInputs(t, ctx, `
-			out/soong/.intermediates/prebuilt_libbar.stubs/android_common/combined/libbar.stubs.jar
-			out/soong/.intermediates/prebuilt_libfoo/android_common_myapex/combined/libfoo.jar
+		checkHiddenAPIIndexFromClassesInputs(t, ctx, ``)
+		checkHiddenAPIIndexFromFlagsInputs(t, ctx, `
+			my-bootclasspath-fragment/index.csv
+			out/soong/.intermediates/frameworks/base/boot/platform-bootclasspath/android_common/hiddenapi-monolithic/index-from-classes.csv
 		`)
 	})
 
@@ -5146,6 +5242,13 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
@@ -5158,6 +5261,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "libfoo",
 			srcs: ["foo/bar/MyClass.java"],
 			apex_available: ["myapex"],
+			permitted_packages: ["foo"],
 		}
 
 		java_sdk_library_import {
@@ -5174,6 +5278,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			srcs: ["foo/bar/MyClass.java"],
 			unsafe_ignore_missing_latest_api: true,
 			apex_available: ["myapex"],
+			permitted_packages: ["bar"],
 		}
 	`
 
@@ -5182,9 +5287,10 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		checkBootDexJarPath(t, ctx, "libbar", "out/soong/.intermediates/libbar/android_common_myapex/hiddenapi/libbar.jar")
 
 		// Verify the correct module jars contribute to the hiddenapi index file.
-		checkHiddenAPIIndexInputs(t, ctx, `
-			out/soong/.intermediates/libbar/android_common_myapex/javac/libbar.jar
-			out/soong/.intermediates/libfoo/android_common_apex10000/javac/libfoo.jar
+		checkHiddenAPIIndexFromClassesInputs(t, ctx, ``)
+		checkHiddenAPIIndexFromFlagsInputs(t, ctx, `
+			my-bootclasspath-fragment/index.csv
+			out/soong/.intermediates/frameworks/base/boot/platform-bootclasspath/android_common/hiddenapi-monolithic/index-from-classes.csv
 		`)
 	})
 
@@ -5220,6 +5326,13 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			name: "my-bootclasspath-fragment",
 			contents: ["libfoo", "libbar"],
 			apex_available: ["myapex"],
+			hidden_api: {
+				annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+				metadata: "my-bootclasspath-fragment/metadata.csv",
+				index: "my-bootclasspath-fragment/index.csv",
+				stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+				all_flags: "my-bootclasspath-fragment/all-flags.csv",
+			},
 		}
 
 		java_import {
@@ -5227,6 +5340,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			prefer: true,
 			jars: ["libfoo.jar"],
 			apex_available: ["myapex"],
+			permitted_packages: ["foo"],
 		}
 
 		java_library {
@@ -5243,6 +5357,7 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 			},
 			apex_available: ["myapex"],
 			shared_library: false,
+			permitted_packages: ["bar"],
 		}
 
 		java_sdk_library {
@@ -5258,9 +5373,10 @@ func TestBootDexJarsFromSourcesAndPrebuilts(t *testing.T) {
 		checkBootDexJarPath(t, ctx, "libbar", "out/soong/.intermediates/myapex.deapexer/android_common/deapexer/javalib/libbar.jar")
 
 		// Verify the correct module jars contribute to the hiddenapi index file.
-		checkHiddenAPIIndexInputs(t, ctx, `
-			out/soong/.intermediates/prebuilt_libbar.stubs/android_common/combined/libbar.stubs.jar
-			out/soong/.intermediates/prebuilt_libfoo/android_common_myapex/combined/libfoo.jar
+		checkHiddenAPIIndexFromClassesInputs(t, ctx, ``)
+		checkHiddenAPIIndexFromFlagsInputs(t, ctx, `
+			my-bootclasspath-fragment/index.csv
+			out/soong/.intermediates/frameworks/base/boot/platform-bootclasspath/android_common/hiddenapi-monolithic/index-from-classes.csv
 		`)
 	})
 }
@@ -5963,6 +6079,8 @@ func TestOverrideApex(t *testing.T) {
 			name: "myapex",
 			key: "myapex.key",
 			apps: ["app"],
+			bpfs: ["bpf"],
+			prebuilts: ["myetc"],
 			overrides: ["oldapex"],
 			updatable: false,
 		}
@@ -5971,6 +6089,8 @@ func TestOverrideApex(t *testing.T) {
 			name: "override_myapex",
 			base: "myapex",
 			apps: ["override_app"],
+			bpfs: ["override_bpf"],
+			prebuilts: ["override_myetc"],
 			overrides: ["unknownapex"],
 			logging_parent: "com.foo.bar",
 			package_name: "test.overridden.package",
@@ -6009,6 +6129,26 @@ func TestOverrideApex(t *testing.T) {
 			base: "app",
 			package_name: "bar",
 		}
+
+		bpf {
+			name: "bpf",
+			srcs: ["bpf.c"],
+		}
+
+		bpf {
+			name: "override_bpf",
+			srcs: ["override_bpf.c"],
+		}
+
+		prebuilt_etc {
+			name: "myetc",
+			src: "myprebuilt",
+		}
+
+		prebuilt_etc {
+			name: "override_myetc",
+			src: "override_myprebuilt",
+		}
 	`, withManifestPackageNameOverrides([]string{"myapex:com.android.myapex"}))
 
 	originalVariant := ctx.ModuleForTests("myapex", "android_common_myapex_image").Module().(android.OverridableModule)
@@ -6026,6 +6166,12 @@ func TestOverrideApex(t *testing.T) {
 
 	ensureNotContains(t, copyCmds, "image.apex/app/app/app.apk")
 	ensureContains(t, copyCmds, "image.apex/app/override_app/override_app.apk")
+
+	ensureNotContains(t, copyCmds, "image.apex/etc/bpf/bpf.o")
+	ensureContains(t, copyCmds, "image.apex/etc/bpf/override_bpf.o")
+
+	ensureNotContains(t, copyCmds, "image.apex/etc/myetc")
+	ensureContains(t, copyCmds, "image.apex/etc/override_myetc")
 
 	apexBundle := module.Module().(*apexBundle)
 	name := apexBundle.Name()
@@ -6049,10 +6195,12 @@ func TestOverrideApex(t *testing.T) {
 	data.Custom(&builder, name, "TARGET_", "", data)
 	androidMk := builder.String()
 	ensureContains(t, androidMk, "LOCAL_MODULE := override_app.override_myapex")
+	ensureContains(t, androidMk, "LOCAL_MODULE := override_bpf.o.override_myapex")
 	ensureContains(t, androidMk, "LOCAL_MODULE := apex_manifest.pb.override_myapex")
 	ensureContains(t, androidMk, "LOCAL_MODULE_STEM := override_myapex.apex")
 	ensureContains(t, androidMk, "LOCAL_OVERRIDES_MODULES := unknownapex myapex")
 	ensureNotContains(t, androidMk, "LOCAL_MODULE := app.myapex")
+	ensureNotContains(t, androidMk, "LOCAL_MODULE := bpf.myapex")
 	ensureNotContains(t, androidMk, "LOCAL_MODULE := override_app.myapex")
 	ensureNotContains(t, androidMk, "LOCAL_MODULE := apex_manifest.pb.myapex")
 	ensureNotContains(t, androidMk, "LOCAL_MODULE_STEM := myapex.apex")
@@ -6839,6 +6987,7 @@ func testNoUpdatableJarsInBootImage(t *testing.T, errmsg string, preparer androi
 			apex_available: [
 				"some-updatable-apex",
 			],
+			permitted_packages: ["some.updatable.apex.lib"],
 		}
 
 		java_library {
@@ -6848,6 +6997,7 @@ func testNoUpdatableJarsInBootImage(t *testing.T, errmsg string, preparer androi
 				"some-non-updatable-apex",
 			],
 			compile_dex: true,
+			permitted_packages: ["some.non.updatable.apex.lib"],
 		}
 
 		bootclasspath_fragment {
@@ -7058,7 +7208,9 @@ func TestUpdatable_should_not_set_generate_classpaths_proto(t *testing.T) {
 				"myapex",
 			],
 		}
-	`)
+	`,
+		dexpreopt.FixtureSetApexSystemServerJars("myapex:foo"),
+	)
 }
 
 func TestNoUpdatableJarsInBootImage(t *testing.T) {
@@ -7088,18 +7240,30 @@ func TestNoUpdatableJarsInBootImage(t *testing.T) {
 	}
 
 	t.Run("updatable jar from ART apex in the ART boot image => ok", func(t *testing.T) {
-		preparer := java.FixtureConfigureBootJars("com.android.art.debug:some-art-lib")
-		fragment := java.ApexVariantReference{
-			Apex:   proptools.StringPtr("com.android.art.debug"),
-			Module: proptools.StringPtr("art-bootclasspath-fragment"),
+		preparer := android.GroupFixturePreparers(
+			java.FixtureConfigureBootJars("com.android.art.debug:some-art-lib"),
+			java.FixtureConfigureApexBootJars("some-non-updatable-apex:some-non-updatable-apex-lib"),
+		)
+		fragments := []java.ApexVariantReference{
+			{
+				Apex:   proptools.StringPtr("com.android.art.debug"),
+				Module: proptools.StringPtr("art-bootclasspath-fragment"),
+			},
+			{
+				Apex:   proptools.StringPtr("some-non-updatable-apex"),
+				Module: proptools.StringPtr("some-non-updatable-fragment"),
+			},
 		}
-		testNoUpdatableJarsInBootImage(t, "", preparer, fragment)
+		testNoUpdatableJarsInBootImage(t, "", preparer, fragments...)
 	})
 
 	t.Run("updatable jar from ART apex in the framework boot image => error", func(t *testing.T) {
 		err := `module "some-art-lib" from updatable apexes \["com.android.art.debug"\] is not allowed in the framework boot image`
 		// Update the dexpreopt BootJars directly.
-		preparer := prepareSetBootJars("com.android.art.debug:some-art-lib")
+		preparer := android.GroupFixturePreparers(
+			prepareSetBootJars("com.android.art.debug:some-art-lib"),
+			java.FixtureConfigureApexBootJars("some-non-updatable-apex:some-non-updatable-apex-lib"),
+		)
 		testNoUpdatableJarsInBootImage(t, err, preparer)
 	})
 
@@ -7119,12 +7283,15 @@ func TestNoUpdatableJarsInBootImage(t *testing.T) {
 
 	t.Run("updatable jar from some other apex in the framework boot image => error", func(t *testing.T) {
 		err := `module "some-updatable-apex-lib" from updatable apexes \["some-updatable-apex"\] is not allowed in the framework boot image`
-		preparer := java.FixtureConfigureBootJars("some-updatable-apex:some-updatable-apex-lib")
+		preparer := android.GroupFixturePreparers(
+			java.FixtureConfigureBootJars("some-updatable-apex:some-updatable-apex-lib"),
+			java.FixtureConfigureApexBootJars("some-non-updatable-apex:some-non-updatable-apex-lib"),
+		)
 		testNoUpdatableJarsInBootImage(t, err, preparer)
 	})
 
 	t.Run("non-updatable jar from some other apex in the framework boot image => ok", func(t *testing.T) {
-		preparer := java.FixtureConfigureBootJars("some-non-updatable-apex:some-non-updatable-apex-lib")
+		preparer := java.FixtureConfigureApexBootJars("some-non-updatable-apex:some-non-updatable-apex-lib")
 		fragment := java.ApexVariantReference{
 			Apex:   proptools.StringPtr("some-non-updatable-apex"),
 			Module: proptools.StringPtr("some-non-updatable-fragment"),
@@ -7152,13 +7319,22 @@ func TestNoUpdatableJarsInBootImage(t *testing.T) {
 	})
 
 	t.Run("platform jar in the framework boot image => ok", func(t *testing.T) {
-		preparer := java.FixtureConfigureBootJars("platform:some-platform-lib")
-		testNoUpdatableJarsInBootImage(t, "", preparer)
+		preparer := android.GroupFixturePreparers(
+			java.FixtureConfigureBootJars("platform:some-platform-lib"),
+			java.FixtureConfigureApexBootJars("some-non-updatable-apex:some-non-updatable-apex-lib"),
+		)
+		fragments := []java.ApexVariantReference{
+			{
+				Apex:   proptools.StringPtr("some-non-updatable-apex"),
+				Module: proptools.StringPtr("some-non-updatable-fragment"),
+			},
+		}
+		testNoUpdatableJarsInBootImage(t, "", preparer, fragments...)
 	})
 }
 
 func TestDexpreoptAccessDexFilesFromPrebuiltApex(t *testing.T) {
-	preparer := java.FixtureConfigureBootJars("myapex:libfoo")
+	preparer := java.FixtureConfigureApexBootJars("myapex:libfoo")
 	t.Run("prebuilt no source", func(t *testing.T) {
 		fragment := java.ApexVariantReference{
 			Apex:   proptools.StringPtr("myapex"),
@@ -7183,18 +7359,26 @@ func TestDexpreoptAccessDexFilesFromPrebuiltApex(t *testing.T) {
 				name: "my-bootclasspath-fragment",
 				contents: ["libfoo"],
 				apex_available: ["myapex"],
+				hidden_api: {
+					annotation_flags: "my-bootclasspath-fragment/annotation-flags.csv",
+					metadata: "my-bootclasspath-fragment/metadata.csv",
+					index: "my-bootclasspath-fragment/index.csv",
+					stub_flags: "my-bootclasspath-fragment/stub-flags.csv",
+					all_flags: "my-bootclasspath-fragment/all-flags.csv",
+				},
 			}
 
 			java_import {
 				name: "libfoo",
 				jars: ["libfoo.jar"],
 				apex_available: ["myapex"],
+				permitted_packages: ["libfoo"],
 			}
 		`, "", preparer, fragment)
 	})
 }
 
-func testApexPermittedPackagesRules(t *testing.T, errmsg, bp string, apexBootJars []string, rules []android.Rule) {
+func testApexPermittedPackagesRules(t *testing.T, errmsg, bp string, bootJars []string, rules []android.Rule) {
 	t.Helper()
 	bp += `
 	apex_key {
@@ -7219,11 +7403,11 @@ func testApexPermittedPackagesRules(t *testing.T, errmsg, bp string, apexBootJar
 		PrepareForTestWithApexBuildComponents,
 		android.PrepareForTestWithNeverallowRules(rules),
 		android.FixtureModifyProductVariables(func(variables android.FixtureProductVariables) {
-			updatableBootJars := make([]string, 0, len(apexBootJars))
-			for _, apexBootJar := range apexBootJars {
-				updatableBootJars = append(updatableBootJars, "myapex:"+apexBootJar)
+			apexBootJars := make([]string, 0, len(bootJars))
+			for _, apexBootJar := range bootJars {
+				apexBootJars = append(apexBootJars, "myapex:"+apexBootJar)
 			}
-			variables.UpdatableBootJars = android.CreateTestConfiguredJarList(updatableBootJars)
+			variables.ApexBootJars = android.CreateTestConfiguredJarList(apexBootJars)
 		}),
 		fs.AddToFixture(),
 	).
@@ -8101,6 +8285,8 @@ func TestApexJavaCoverage(t *testing.T) {
 		java.PrepareForTestWithJavaDefaultModules,
 		android.PrepareForTestWithAndroidBuildComponents,
 		android.FixtureWithRootAndroidBp(bp),
+		dexpreopt.FixtureSetApexBootJars("myapex:mybootclasspathlib"),
+		dexpreopt.FixtureSetApexSystemServerJars("myapex:mysystemserverclasspathlib"),
 		android.FixtureMergeEnv(map[string]string{
 			"EMMA_INSTRUMENT": "true",
 		}),
@@ -8116,6 +8302,57 @@ func TestApexJavaCoverage(t *testing.T) {
 	if result.ModuleForTests("mysystemserverclasspathlib", "android_common_apex10000").MaybeRule("jacoco").Rule == nil {
 		t.Errorf("Failed to find jacoco rule for mysystemserverclasspathlib")
 	}
+}
+
+func TestProhibitStaticExecutable(t *testing.T) {
+	testApexError(t, `executable mybin is static`, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			binaries: ["mybin"],
+			min_sdk_version: "29",
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+
+		cc_binary {
+			name: "mybin",
+			srcs: ["mylib.cpp"],
+			relative_install_path: "foo/bar",
+			static_executable: true,
+			system_shared_libs: [],
+			stl: "none",
+			apex_available: [ "myapex" ],
+			min_sdk_version: "29",
+		}
+	`)
+
+	testApexError(t, `executable mybin.rust is static`, `
+		apex {
+			name: "myapex",
+			key: "myapex.key",
+			binaries: ["mybin.rust"],
+			min_sdk_version: "29",
+		}
+
+		apex_key {
+			name: "myapex.key",
+			public_key: "testkey.avbpubkey",
+			private_key: "testkey.pem",
+		}
+
+		rust_binary {
+			name: "mybin.rust",
+			srcs: ["foo.rs"],
+			static_executable: true,
+			apex_available: ["myapex"],
+			min_sdk_version: "29",
+		}
+	`)
 }
 
 func TestMain(m *testing.M) {

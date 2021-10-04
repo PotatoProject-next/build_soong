@@ -35,7 +35,7 @@ import (
 //   continue on to GenerateAndroidBuildActions
 
 // RegisterMutatorsForBazelConversion is a alternate registration pipeline for bp2build. Exported for testing.
-func RegisterMutatorsForBazelConversion(ctx *Context, preArchMutators, depsMutators, bp2buildMutators []RegisterMutatorFunc) {
+func RegisterMutatorsForBazelConversion(ctx *Context, preArchMutators, bp2buildMutators []RegisterMutatorFunc) {
 	mctx := &registerMutatorsContext{
 		bazelConversionMode: true,
 	}
@@ -50,16 +50,6 @@ func RegisterMutatorsForBazelConversion(ctx *Context, preArchMutators, depsMutat
 		preArchMutators...)
 
 	for _, f := range bp2buildPreArchMutators {
-		f(mctx)
-	}
-
-	bp2buildDepsMutators = append([]RegisterMutatorFunc{
-		registerDepsMutatorBp2Build,
-		registerPathDepsMutator,
-		registerBp2buildArchPathDepsMutator,
-	}, depsMutators...)
-
-	for _, f := range bp2buildDepsMutators {
 		f(mctx)
 	}
 
@@ -227,7 +217,6 @@ func FinalDepsMutators(f RegisterMutatorFunc) {
 }
 
 var bp2buildPreArchMutators = []RegisterMutatorFunc{}
-var bp2buildDepsMutators = []RegisterMutatorFunc{}
 var bp2buildMutators = map[string]RegisterMutatorFunc{}
 
 // See http://b/192523357
@@ -254,12 +243,6 @@ func PreArchBp2BuildMutators(f RegisterMutatorFunc) {
 	bp2buildPreArchMutators = append(bp2buildPreArchMutators, f)
 }
 
-// DepsBp2BuildMutators adds mutators to be register for converting Android Blueprint modules into
-// Bazel BUILD targets that should run prior to conversion to resolve dependencies.
-func DepsBp2BuildMutators(f RegisterMutatorFunc) {
-	bp2buildDepsMutators = append(bp2buildDepsMutators, f)
-}
-
 type BaseMutatorContext interface {
 	BaseModuleContext
 
@@ -269,6 +252,9 @@ type BaseMutatorContext interface {
 	// Rename all variants of a module.  The new name is not visible to calls to ModuleName,
 	// AddDependency or OtherModuleName until after this mutator pass is complete.
 	Rename(name string)
+
+	// BazelConversionMode returns whether this mutator is being run as part of Bazel Conversion.
+	BazelConversionMode() bool
 }
 
 type TopDownMutator func(TopDownMutatorContext)
@@ -284,7 +270,7 @@ type TopDownMutatorContext interface {
 	// factory method, just like in CreateModule, but also requires
 	// BazelTargetModuleProperties containing additional metadata for the
 	// bp2build codegenerator.
-	CreateBazelTargetModule(ModuleFactory, string, bazel.BazelTargetModuleProperties, interface{}) BazelTargetModule
+	CreateBazelTargetModule(string, bazel.BazelTargetModuleProperties, interface{})
 }
 
 type topDownMutatorContext struct {
@@ -410,26 +396,24 @@ type BottomUpMutatorContext interface {
 	// variant of the current module.  The value should not be modified after being passed to
 	// SetVariationProvider.
 	SetVariationProvider(module blueprint.Module, provider blueprint.ProviderKey, value interface{})
-
-	// BazelConversionMode returns whether this mutator is being run as part of Bazel Conversion.
-	BazelConversionMode() bool
 }
 
 type bottomUpMutatorContext struct {
 	bp blueprint.BottomUpMutatorContext
 	baseModuleContext
-	finalPhase          bool
-	bazelConversionMode bool
+	finalPhase bool
 }
 
 func bottomUpMutatorContextFactory(ctx blueprint.BottomUpMutatorContext, a Module,
 	finalPhase, bazelConversionMode bool) BottomUpMutatorContext {
 
+	moduleContext := a.base().baseModuleContextFactory(ctx)
+	moduleContext.bazelConversionMode = bazelConversionMode
+
 	return &bottomUpMutatorContext{
-		bp:                  ctx,
-		baseModuleContext:   a.base().baseModuleContextFactory(ctx),
-		finalPhase:          finalPhase,
-		bazelConversionMode: bazelConversionMode,
+		bp:                ctx,
+		baseModuleContext: a.base().baseModuleContextFactory(ctx),
+		finalPhase:        finalPhase,
 	}
 }
 
@@ -462,9 +446,11 @@ func (x *registerMutatorsContext) mutatorName(name string) string {
 func (x *registerMutatorsContext) TopDown(name string, m TopDownMutator) MutatorHandle {
 	f := func(ctx blueprint.TopDownMutatorContext) {
 		if a, ok := ctx.Module().(Module); ok {
+			moduleContext := a.base().baseModuleContextFactory(ctx)
+			moduleContext.bazelConversionMode = x.bazelConversionMode
 			actx := &topDownMutatorContext{
 				bp:                ctx,
-				baseModuleContext: a.base().baseModuleContextFactory(ctx),
+				baseModuleContext: moduleContext,
 			}
 			m(actx)
 		}
@@ -530,26 +516,24 @@ func registerDepsMutatorBp2Build(ctx RegisterMutatorsContext) {
 }
 
 func (t *topDownMutatorContext) CreateBazelTargetModule(
-	factory ModuleFactory,
 	name string,
 	bazelProps bazel.BazelTargetModuleProperties,
-	attrs interface{}) BazelTargetModule {
+	attrs interface{}) {
 	if strings.HasPrefix(name, bazel.BazelTargetModuleNamePrefix) {
 		panic(fmt.Errorf(
 			"The %s name prefix is added automatically, do not set it manually: %s",
 			bazel.BazelTargetModuleNamePrefix,
 			name))
 	}
-	name = bazel.BazelTargetModuleNamePrefix + name
-	nameProp := struct {
-		Name *string
-	}{
-		Name: &name,
+
+	info := bp2buildInfo{
+		Name:       name,
+		Dir:        t.OtherModuleDir(t.Module()),
+		BazelProps: bazelProps,
+		Attrs:      attrs,
 	}
 
-	b := t.createModuleWithoutInheritance(factory, &nameProp, attrs).(BazelTargetModule)
-	b.SetBazelTargetModuleProperties(bazelProps)
-	return b
+	t.Module().base().addBp2buildInfo(info)
 }
 
 func (t *topDownMutatorContext) AppendProperties(props ...interface{}) {
@@ -732,8 +716,4 @@ func (b *bottomUpMutatorContext) CreateAliasVariation(fromVariationName, toVaria
 
 func (b *bottomUpMutatorContext) SetVariationProvider(module blueprint.Module, provider blueprint.ProviderKey, value interface{}) {
 	b.bp.SetVariationProvider(module, provider, value)
-}
-
-func (b *bottomUpMutatorContext) BazelConversionMode() bool {
-	return b.bazelConversionMode
 }

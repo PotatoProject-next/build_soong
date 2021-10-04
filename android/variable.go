@@ -42,6 +42,14 @@ type variableProperties struct {
 			Cflags  []string
 		}
 
+		Platform_sdk_version_or_codename struct {
+			Java_resource_dirs []string
+		}
+
+		Platform_sdk_extension_version struct {
+			Cmd *string
+		}
+
 		// unbundled_build is a catch-all property to annotate modules that don't build in one or
 		// more unbundled branches, usually due to dependencies missing from the manifest.
 		Unbundled_build struct {
@@ -104,6 +112,8 @@ type variableProperties struct {
 			Static_libs       []string
 			Whole_static_libs []string
 			Shared_libs       []string
+
+			Cmdline []string
 		}
 
 		// eng is true for -eng builds, and can be used to turn on additionaly heavyweight debugging
@@ -164,7 +174,9 @@ type productVariables struct {
 	Platform_version_name                     *string  `json:",omitempty"`
 	Platform_sdk_version                      *int     `json:",omitempty"`
 	Platform_sdk_codename                     *string  `json:",omitempty"`
+	Platform_sdk_version_or_codename          *string  `json:",omitempty"`
 	Platform_sdk_final                        *bool    `json:",omitempty"`
+	Platform_sdk_extension_version            *int     `json:",omitempty"`
 	Platform_version_active_codenames         []string `json:",omitempty"`
 	Platform_vndk_version                     *string  `json:",omitempty"`
 	Platform_systemsdk_versions               []string `json:",omitempty"`
@@ -203,6 +215,7 @@ type productVariables struct {
 
 	HostArch          *string `json:",omitempty"`
 	HostSecondaryArch *string `json:",omitempty"`
+	HostMusl          *bool   `json:",omitempty"`
 
 	CrossHost              *string `json:",omitempty"`
 	CrossHostArch          *string `json:",omitempty"`
@@ -225,6 +238,7 @@ type productVariables struct {
 	Allow_missing_dependencies   *bool `json:",omitempty"`
 	Unbundled_build              *bool `json:",omitempty"`
 	Unbundled_build_apps         *bool `json:",omitempty"`
+	Unbundled_build_image        *bool `json:",omitempty"`
 	Always_use_prebuilt_sdks     *bool `json:",omitempty"`
 	Skip_boot_jars_check         *bool `json:",omitempty"`
 	Malloc_not_svelte            *bool `json:",omitempty"`
@@ -251,8 +265,8 @@ type productVariables struct {
 	UncompressPrivAppDex             *bool    `json:",omitempty"`
 	ModulesLoadedByPrivilegedModules []string `json:",omitempty"`
 
-	BootJars          ConfiguredJarList `json:",omitempty"`
-	UpdatableBootJars ConfiguredJarList `json:",omitempty"`
+	BootJars     ConfiguredJarList `json:",omitempty"`
+	ApexBootJars ConfiguredJarList `json:",omitempty"`
 
 	IntegerOverflowExcludePaths []string `json:",omitempty"`
 
@@ -297,8 +311,6 @@ type productVariables struct {
 	BtConfigIncludeDir *string `json:",omitempty"`
 
 	Override_rs_driver *string `json:",omitempty"`
-
-	Fuchsia *bool `json:",omitempty"`
 
 	DeviceKernelHeaders []string `json:",omitempty"`
 
@@ -441,8 +453,8 @@ func (v *productVariables) SetDefaultConfig() {
 		Malloc_pattern_fill_contents: boolPtr(false),
 		Safestack:                    boolPtr(false),
 
-		BootJars:          ConfiguredJarList{apexes: []string{}, jars: []string{}},
-		UpdatableBootJars: ConfiguredJarList{apexes: []string{}, jars: []string{}},
+		BootJars:     ConfiguredJarList{apexes: []string{}, jars: []string{}},
+		ApexBootJars: ConfiguredJarList{apexes: []string{}, jars: []string{}},
 	}
 
 	if runtime.GOOS == "linux" {

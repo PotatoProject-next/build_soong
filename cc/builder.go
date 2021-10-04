@@ -205,11 +205,13 @@ var (
 			Labels:       map[string]string{"type": "lint", "tool": "clang-tidy", "lang": "cpp"},
 			ExecStrategy: "${config.REClangTidyExecStrategy}",
 			Inputs:       []string{"$in"},
-			// OutputFile here is $in for remote-execution since its possible that
-			// clang-tidy modifies the given input file itself and $out refers to the
-			// ".tidy" file generated for ninja-dependency reasons.
-			OutputFiles: []string{"$in"},
-			Platform:    map[string]string{remoteexec.PoolKey: "${config.REClangTidyPool}"},
+			// Although clang-tidy has an option to "fix" source files, that feature is hardly useable
+			// under parallel compilation and RBE. So we assume no OutputFiles here.
+			// The clang-tidy fix option is best run locally in single thread.
+			// Copying source file back to local caused two problems:
+			// (1) New timestamps trigger clang and clang-tidy compilations again.
+			// (2) Changing source files caused concurrent clang or clang-tidy jobs to crash.
+			Platform: map[string]string{remoteexec.PoolKey: "${config.REClangTidyPool}"},
 		}, []string{"cFlags", "tidyFlags"}, []string{})
 
 	_ = pctx.SourcePathVariable("yasmCmd", "prebuilts/misc/${config.HostPrebuiltTag}/yasm/yasm")
@@ -237,7 +239,7 @@ var (
 	// -w has been added since header-abi-dumper does not need to produce any sort of diagnostic information.
 	sAbiDump, sAbiDumpRE = pctx.RemoteStaticRules("sAbiDump",
 		blueprint.RuleParams{
-			Command:     "rm -f $out && $reTemplate$sAbiDumper -o ${out} $in $exportDirs -- $cFlags -w -isystem prebuilts/clang-tools/${config.HostPrebuiltTag}/clang-headers",
+			Command:     "rm -f $out && $reTemplate$sAbiDumper --root-dir . --root-dir $$OUT_DIR:out -o ${out} $in $exportDirs -- $cFlags -w -isystem prebuilts/clang-tools/${config.HostPrebuiltTag}/clang-headers",
 			CommandDeps: []string{"$sAbiDumper"},
 		}, &remoteexec.REParams{
 			Labels:       map[string]string{"type": "abi-dump", "tool": "header-abi-dumper"},
@@ -255,7 +257,7 @@ var (
 	// sAbi dump file.
 	sAbiLink, sAbiLinkRE = pctx.RemoteStaticRules("sAbiLink",
 		blueprint.RuleParams{
-			Command:        "$reTemplate$sAbiLinker -o ${out} $symbolFilter -arch $arch  $exportedHeaderFlags @${out}.rsp ",
+			Command:        "$reTemplate$sAbiLinker --root-dir . --root-dir $$OUT_DIR:out -o ${out} $symbolFilter -arch $arch $exportedHeaderFlags @${out}.rsp",
 			CommandDeps:    []string{"$sAbiLinker"},
 			Rspfile:        "${out}.rsp",
 			RspfileContent: "${in}",
@@ -384,9 +386,6 @@ type builderFlags struct {
 
 	systemIncludeFlags string
 
-	// True if static libraries should be grouped (using `-Wl,--start-group` and `-Wl,--end-group`).
-	groupStaticLibs bool
-
 	proto            android.ProtoFlags
 	protoC           bool // If true, compile protos as `.c` files. Otherwise, output as `.cc`.
 	protoOptionsFile bool // If true, output a proto options file.
@@ -500,10 +499,10 @@ func transformSourceToObj(ctx android.ModuleContext, subdir string, srcFiles and
 		sAbiDumpFiles = make(android.Paths, 0, len(srcFiles))
 	}
 
-	cflags += " ${config.NoOverrideClangGlobalCflags}"
-	toolingCflags += " ${config.NoOverrideClangGlobalCflags}"
-	cppflags += " ${config.NoOverrideClangGlobalCflags}"
-	toolingCppflags += " ${config.NoOverrideClangGlobalCflags}"
+	cflags += " ${config.NoOverrideGlobalCflags}"
+	toolingCflags += " ${config.NoOverrideGlobalCflags}"
+	cppflags += " ${config.NoOverrideGlobalCflags}"
+	toolingCppflags += " ${config.NoOverrideGlobalCflags}"
 
 	for i, srcFile := range srcFiles {
 		objFile := android.ObjPathWithExt(ctx, subdir, srcFile, "o")
@@ -646,7 +645,7 @@ func transformSourceToObj(ctx android.ModuleContext, subdir string, srcFiles and
 				OrderOnly: pathDeps,
 				Args: map[string]string{
 					"cFlags":    moduleToolingFlags,
-					"tidyFlags": flags.tidyFlags,
+					"tidyFlags": config.TidyFlagsForSrcFile(srcFile, flags.tidyFlags),
 				},
 			})
 		}
@@ -752,13 +751,7 @@ func transformObjToDynamicBinary(ctx android.ModuleContext,
 		}
 	}
 
-	if flags.groupStaticLibs && !ctx.Darwin() && len(staticLibs) > 0 {
-		libFlagsList = append(libFlagsList, "-Wl,--start-group")
-	}
 	libFlagsList = append(libFlagsList, staticLibs.Strings()...)
-	if flags.groupStaticLibs && !ctx.Darwin() && len(staticLibs) > 0 {
-		libFlagsList = append(libFlagsList, "-Wl,--end-group")
-	}
 
 	if groupLate && !ctx.Darwin() && len(lateStaticLibs) > 0 {
 		libFlagsList = append(libFlagsList, "-Wl,--start-group")

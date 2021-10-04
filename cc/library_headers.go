@@ -44,13 +44,13 @@ func RegisterLibraryHeadersBuildComponents(ctx android.RegistrationContext) {
 }
 
 type libraryHeaderBazelHander struct {
-	bazelHandler
+	android.BazelHandler
 
 	module  *Module
 	library *libraryDecorator
 }
 
-func (h *libraryHeaderBazelHander) generateBazelBuildActions(ctx android.ModuleContext, label string) bool {
+func (h *libraryHeaderBazelHander) GenerateBazelBuildActions(ctx android.ModuleContext, label string) bool {
 	bazelCtx := ctx.Config().BazelContext
 	ccInfo, ok, err := bazelCtx.GetCcInfo(label, ctx.Arch().ArchType)
 	if err != nil {
@@ -108,18 +108,7 @@ type bazelCcLibraryHeadersAttributes struct {
 	Includes            bazel.StringListAttribute
 	Deps                bazel.LabelListAttribute
 	Implementation_deps bazel.LabelListAttribute
-}
-
-type bazelCcLibraryHeaders struct {
-	android.BazelTargetModuleBase
-	bazelCcLibraryHeadersAttributes
-}
-
-func BazelCcLibraryHeadersFactory() android.Module {
-	module := &bazelCcLibraryHeaders{}
-	module.AddProperties(&module.bazelCcLibraryHeadersAttributes)
-	android.InitBazelTargetModule(module)
-	return module
+	System_dynamic_deps bazel.LabelListAttribute
 }
 
 func CcLibraryHeadersBp2Build(ctx android.TopDownMutatorContext) {
@@ -146,6 +135,7 @@ func CcLibraryHeadersBp2Build(ctx android.TopDownMutatorContext) {
 		Includes:            exportedIncludes,
 		Implementation_deps: linkerAttrs.deps,
 		Deps:                linkerAttrs.exportedDeps,
+		System_dynamic_deps: linkerAttrs.systemDynamicDeps,
 	}
 
 	props := bazel.BazelTargetModuleProperties{
@@ -153,11 +143,5 @@ func CcLibraryHeadersBp2Build(ctx android.TopDownMutatorContext) {
 		Bzl_load_location: "//build/bazel/rules:cc_library_headers.bzl",
 	}
 
-	ctx.CreateBazelTargetModule(BazelCcLibraryHeadersFactory, module.Name(), props, attrs)
+	ctx.CreateBazelTargetModule(module.Name(), props, attrs)
 }
-
-func (m *bazelCcLibraryHeaders) Name() string {
-	return m.BaseModuleName()
-}
-
-func (m *bazelCcLibraryHeaders) GenerateAndroidBuildActions(ctx android.ModuleContext) {}

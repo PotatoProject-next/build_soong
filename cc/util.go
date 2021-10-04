@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"android/soong/android"
+	"android/soong/snapshot"
 )
 
 // Efficiently converts a list of include directories to a single string
@@ -90,7 +91,6 @@ func flagsToBuilderFlags(in Flags) builderFlags {
 		systemIncludeFlags: strings.Join(in.SystemIncludeFlags, " "),
 
 		assemblerWithCpp: in.AssemblerWithCpp,
-		groupStaticLibs:  in.GroupStaticLibs,
 
 		proto:            in.proto,
 		protoC:           in.protoC,
@@ -126,20 +126,6 @@ func makeSymlinkCmd(linkDirOnDevice string, linkName string, target string) stri
 		"ln -sf " + target + " " + filepath.Join(dir, linkName)
 }
 
-func copyFileRule(ctx android.SingletonContext, path android.Path, out string) android.OutputPath {
-	outPath := android.PathForOutput(ctx, out)
-	ctx.Build(pctx, android.BuildParams{
-		Rule:        android.Cp,
-		Input:       path,
-		Output:      outPath,
-		Description: "copy " + path.String() + " -> " + out,
-		Args: map[string]string{
-			"cpFlags": "-f -L",
-		},
-	})
-	return outPath
-}
-
 func combineNoticesRule(ctx android.SingletonContext, paths android.Paths, out string) android.OutputPath {
 	outPath := android.PathForOutput(ctx, out)
 	ctx.Build(pctx, android.BuildParams{
@@ -148,12 +134,6 @@ func combineNoticesRule(ctx android.SingletonContext, paths android.Paths, out s
 		Output:      outPath,
 		Description: "combine notices for " + out,
 	})
-	return outPath
-}
-
-func writeStringToFileRule(ctx android.SingletonContext, content, out string) android.OutputPath {
-	outPath := android.PathForOutput(ctx, out)
-	android.WriteFileRule(ctx, outPath, content)
 	return outPath
 }
 
@@ -172,5 +152,5 @@ func installMapListFileRule(ctx android.SingletonContext, m map[string]string, p
 		txtBuilder.WriteString(" ")
 		txtBuilder.WriteString(m[k])
 	}
-	return writeStringToFileRule(ctx, txtBuilder.String(), path)
+	return snapshot.WriteStringToFileRule(ctx, txtBuilder.String(), path)
 }

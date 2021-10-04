@@ -171,9 +171,9 @@ func NewTestArchContext(config Config) *TestContext {
 
 type TestContext struct {
 	*Context
-	preArch, preDeps, postDeps, finalDeps           []RegisterMutatorFunc
-	bp2buildPreArch, bp2buildDeps, bp2buildMutators []RegisterMutatorFunc
-	NameResolver                                    *NameResolver
+	preArch, preDeps, postDeps, finalDeps []RegisterMutatorFunc
+	bp2buildPreArch, bp2buildMutators     []RegisterMutatorFunc
+	NameResolver                          *NameResolver
 
 	// The list of pre-singletons and singletons registered for the test.
 	preSingletons, singletons sortableComponents
@@ -222,12 +222,6 @@ func (ctx *TestContext) RegisterBp2BuildMutator(moduleType string, m func(TopDow
 // into Bazel BUILD targets that should run prior to deps and conversion.
 func (ctx *TestContext) PreArchBp2BuildMutators(f RegisterMutatorFunc) {
 	ctx.bp2buildPreArch = append(ctx.bp2buildPreArch, f)
-}
-
-// DepsBp2BuildMutators adds mutators to be register for converting Android Blueprint modules into
-// Bazel BUILD targets that should run prior to conversion to resolve dependencies.
-func (ctx *TestContext) DepsBp2BuildMutators(f RegisterMutatorFunc) {
-	ctx.bp2buildDeps = append(ctx.bp2buildDeps, f)
 }
 
 // registeredComponentOrder defines the order in which a sortableComponent type is registered at
@@ -464,7 +458,7 @@ func (ctx *TestContext) Register() {
 
 // RegisterForBazelConversion prepares a test context for bp2build conversion.
 func (ctx *TestContext) RegisterForBazelConversion() {
-	RegisterMutatorsForBazelConversion(ctx.Context, ctx.bp2buildPreArch, ctx.bp2buildDeps, ctx.bp2buildMutators)
+	RegisterMutatorsForBazelConversion(ctx.Context, ctx.bp2buildPreArch, ctx.bp2buildMutators)
 }
 
 func (ctx *TestContext) ParseFileList(rootDir string, filePaths []string) (deps []string, errs []error) {
@@ -670,15 +664,15 @@ func newBaseTestingComponent(config Config, provider testBuildProvider) baseTest
 // containing at most one instance of the temporary build directory at the start of the path while
 // this assumes that there can be any number at any position.
 func normalizeStringRelativeToTop(config Config, s string) string {
-	// The buildDir usually looks something like: /tmp/testFoo2345/001
+	// The soongOutDir usually looks something like: /tmp/testFoo2345/001
 	//
-	// Replace any usage of the buildDir with out/soong, e.g. replace "/tmp/testFoo2345/001" with
+	// Replace any usage of the soongOutDir with out/soong, e.g. replace "/tmp/testFoo2345/001" with
 	// "out/soong".
-	outSoongDir := filepath.Clean(config.buildDir)
+	outSoongDir := filepath.Clean(config.soongOutDir)
 	re := regexp.MustCompile(`\Q` + outSoongDir + `\E\b`)
 	s = re.ReplaceAllString(s, "out/soong")
 
-	// Replace any usage of the buildDir/.. with out, e.g. replace "/tmp/testFoo2345" with
+	// Replace any usage of the soongOutDir/.. with out, e.g. replace "/tmp/testFoo2345" with
 	// "out". This must come after the previous replacement otherwise this would replace
 	// "/tmp/testFoo2345/001" with "out/001" instead of "out/soong".
 	outDir := filepath.Dir(outSoongDir)
@@ -997,7 +991,7 @@ func NormalizePathForTesting(path Path) string {
 	}
 	p := path.String()
 	if w, ok := path.(WritablePath); ok {
-		rel, err := filepath.Rel(w.getBuildDir(), p)
+		rel, err := filepath.Rel(w.getSoongOutDir(), p)
 		if err != nil {
 			panic(err)
 		}

@@ -111,14 +111,8 @@ type apexBundleProperties struct {
 	// List of java libraries that are embedded inside this APEX bundle.
 	Java_libs []string
 
-	// List of prebuilt files that are embedded inside this APEX bundle.
-	Prebuilts []string
-
 	// List of platform_compat_config files that are embedded inside this APEX bundle.
 	Compat_configs []string
-
-	// List of BPF programs inside this APEX bundle.
-	Bpfs []string
 
 	// List of filesystem images that are embedded inside this APEX bundle.
 	Filesystems []string
@@ -294,8 +288,14 @@ type overridableProperties struct {
 	// List of APKs that are embedded inside this APEX.
 	Apps []string
 
+	// List of prebuilt files that are embedded inside this APEX bundle.
+	Prebuilts []string
+
 	// List of runtime resource overlays (RROs) that are embedded inside this APEX.
 	Rros []string
+
+	// List of BPF programs inside this APEX bundle.
+	Bpfs []string
 
 	// Names of modules to be overridden. Listed modules can only be other binaries (in Make or
 	// Soong). This does not completely prevent installation of the overridden binaries, but if
@@ -684,7 +684,6 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 	// each target os/architectures, appropriate dependencies are selected by their
 	// target.<os>.multilib.<type> groups and are added as (direct) dependencies.
 	targets := ctx.MultiTargets()
-	config := ctx.DeviceConfig()
 	imageVariation := a.getImageVariation(ctx)
 
 	a.combineProperties(ctx)
@@ -758,29 +757,11 @@ func (a *apexBundle) DepsMutator(ctx android.BottomUpMutatorContext) {
 		}
 	}
 
-	if prebuilts := a.properties.Prebuilts; len(prebuilts) > 0 {
-		// For prebuilt_etc, use the first variant (64 on 64/32bit device, 32 on 32bit device)
-		// regardless of the TARGET_PREFER_* setting. See b/144532908
-		archForPrebuiltEtc := config.Arches()[0]
-		for _, arch := range config.Arches() {
-			// Prefer 64-bit arch if there is any
-			if arch.ArchType.Multilib == "lib64" {
-				archForPrebuiltEtc = arch
-				break
-			}
-		}
-		ctx.AddFarVariationDependencies([]blueprint.Variation{
-			{Mutator: "os", Variation: ctx.Os().String()},
-			{Mutator: "arch", Variation: archForPrebuiltEtc.String()},
-		}, prebuiltTag, prebuilts...)
-	}
-
 	// Common-arch dependencies come next
 	commonVariation := ctx.Config().AndroidCommonTarget.Variations()
 	ctx.AddFarVariationDependencies(commonVariation, bcpfTag, a.properties.Bootclasspath_fragments...)
 	ctx.AddFarVariationDependencies(commonVariation, sscpfTag, a.properties.Systemserverclasspath_fragments...)
 	ctx.AddFarVariationDependencies(commonVariation, javaLibTag, a.properties.Java_libs...)
-	ctx.AddFarVariationDependencies(commonVariation, bpfTag, a.properties.Bpfs...)
 	ctx.AddFarVariationDependencies(commonVariation, fsTag, a.properties.Filesystems...)
 	ctx.AddFarVariationDependencies(commonVariation, compatConfigTag, a.properties.Compat_configs...)
 
@@ -813,7 +794,27 @@ func (a *apexBundle) OverridablePropertiesDepsMutator(ctx android.BottomUpMutato
 
 	commonVariation := ctx.Config().AndroidCommonTarget.Variations()
 	ctx.AddFarVariationDependencies(commonVariation, androidAppTag, a.overridableProperties.Apps...)
+	ctx.AddFarVariationDependencies(commonVariation, bpfTag, a.overridableProperties.Bpfs...)
 	ctx.AddFarVariationDependencies(commonVariation, rroTag, a.overridableProperties.Rros...)
+	if prebuilts := a.overridableProperties.Prebuilts; len(prebuilts) > 0 {
+		// For prebuilt_etc, use the first variant (64 on 64/32bit device, 32 on 32bit device)
+		// regardless of the TARGET_PREFER_* setting. See b/144532908
+		arches := ctx.DeviceConfig().Arches()
+		if len(arches) != 0 {
+			archForPrebuiltEtc := arches[0]
+			for _, arch := range arches {
+				// Prefer 64-bit arch if there is any
+				if arch.ArchType.Multilib == "lib64" {
+					archForPrebuiltEtc = arch
+					break
+				}
+			}
+			ctx.AddFarVariationDependencies([]blueprint.Variation{
+				{Mutator: "os", Variation: ctx.Os().String()},
+				{Mutator: "arch", Variation: archForPrebuiltEtc.String()},
+			}, prebuiltTag, prebuilts...)
+		}
+	}
 
 	// Dependencies for signing
 	if String(a.overridableProperties.Key) == "" {
@@ -1100,13 +1101,6 @@ func apexMutator(mctx android.BottomUpMutatorContext) {
 			mctx.ModuleErrorf("base property is not set")
 			return
 		}
-		// Workaround the issue reported in b/191269918 by using the unprefixed module name of this
-		// module as the default variation to use if dependencies of this module do not have the correct
-		// apex variant name. This name matches the name used to create the variations of modules for
-		// which apexModuleTypeRequiresVariant return true.
-		// TODO(b/191269918): Remove this workaround.
-		unprefixedModuleName := android.RemoveOptionalPrebuiltPrefix(mctx.ModuleName())
-		mctx.SetDefaultDependencyVariation(&unprefixedModuleName)
 		mctx.CreateVariations(apexBundleName)
 		if strings.HasPrefix(apexBundleName, "com.android.art") {
 			// TODO(b/183882457): See note for CreateAliasVariation above.
@@ -1587,6 +1581,7 @@ type androidApp interface {
 	JacocoReportClassesFile() android.Path
 	Certificate() java.Certificate
 	BaseModuleName() string
+	LintDepSets() java.LintDepSets
 }
 
 var _ androidApp = (*java.AndroidApp)(nil)
@@ -1601,6 +1596,7 @@ func apexFileForAndroidApp(ctx android.BaseModuleContext, aapp androidApp) apexF
 	fileToCopy := aapp.OutputFile()
 	af := newApexFile(ctx, fileToCopy, aapp.BaseModuleName(), dirInApex, app, aapp)
 	af.jacocoReportClassesFile = aapp.JacocoReportClassesFile()
+	af.lintDepSets = aapp.LintDepSets()
 	af.certificate = aapp.Certificate()
 
 	if app, ok := aapp.(interface {
@@ -1696,6 +1692,7 @@ func (a *apexBundle) GenerateAndroidBuildActions(ctx android.ModuleContext) {
 	a.checkUpdatable(ctx)
 	a.checkMinSdkVersion(ctx)
 	a.checkStaticLinkingToStubLibraries(ctx)
+	a.checkStaticExecutables(ctx)
 	if len(a.properties.Tests) > 0 && !a.testApex {
 		ctx.PropertyErrorf("tests", "property allowed only in apex_test module type")
 		return
@@ -2240,6 +2237,7 @@ func newApexBundle() *apexBundle {
 	android.InitDefaultableModule(module)
 	android.InitSdkAwareModule(module)
 	android.InitOverridableModule(module, &module.overridableProperties.Overrides)
+	android.InitBazelModule(module)
 	return module
 }
 
@@ -2484,6 +2482,41 @@ func (a *apexBundle) checkApexAvailability(ctx android.ModuleContext) {
 		// Visit this module's dependencies to check and report any issues with their availability.
 		return true
 	})
+}
+
+// checkStaticExecutable ensures that executables in an APEX are not static.
+func (a *apexBundle) checkStaticExecutables(ctx android.ModuleContext) {
+	// No need to run this for host APEXes
+	if ctx.Host() {
+		return
+	}
+
+	ctx.VisitDirectDepsBlueprint(func(module blueprint.Module) {
+		if ctx.OtherModuleDependencyTag(module) != executableTag {
+			return
+		}
+
+		if l, ok := module.(cc.LinkableInterface); ok && l.StaticExecutable() {
+			apex := a.ApexVariationName()
+			exec := ctx.OtherModuleName(module)
+			if isStaticExecutableAllowed(apex, exec) {
+				return
+			}
+			ctx.ModuleErrorf("executable %s is static", ctx.OtherModuleName(module))
+		}
+	})
+}
+
+// A small list of exceptions where static executables are allowed in APEXes.
+func isStaticExecutableAllowed(apex string, exec string) bool {
+	m := map[string][]string{
+		"com.android.runtime": []string{
+			"linker",
+			"linkerconfig",
+		},
+	}
+	execNames, ok := m[apex]
+	return ok && android.InList(exec, execNames)
 }
 
 // Collect information for opening IDE project files in java/jdeps.go.
@@ -3186,19 +3219,17 @@ func rModulesPackages() map[string][]string {
 // For Bazel / bp2build
 
 type bazelApexBundleAttributes struct {
-	Manifest bazel.LabelAttribute
-}
-
-type bazelApexBundle struct {
-	android.BazelTargetModuleBase
-	bazelApexBundleAttributes
-}
-
-func BazelApexBundleFactory() android.Module {
-	module := &bazelApexBundle{}
-	module.AddProperties(&module.bazelApexBundleAttributes)
-	android.InitBazelTargetModule(module)
-	return module
+	Manifest           bazel.LabelAttribute
+	Android_manifest   bazel.LabelAttribute
+	File_contexts      bazel.LabelAttribute
+	Key                bazel.LabelAttribute
+	Certificate        bazel.LabelAttribute
+	Min_sdk_version    string
+	Updatable          bazel.BoolAttribute
+	Installable        bazel.BoolAttribute
+	Native_shared_libs bazel.LabelListAttribute
+	Binaries           bazel.StringListAttribute
+	Prebuilts          bazel.LabelListAttribute
 }
 
 func ApexBundleBp2Build(ctx android.TopDownMutatorContext) {
@@ -3219,14 +3250,68 @@ func ApexBundleBp2Build(ctx android.TopDownMutatorContext) {
 
 func apexBundleBp2BuildInternal(ctx android.TopDownMutatorContext, module *apexBundle) {
 	var manifestLabelAttribute bazel.LabelAttribute
-
-	manifestStringPtr := module.properties.Manifest
 	if module.properties.Manifest != nil {
-		manifestLabelAttribute.SetValue(android.BazelLabelForModuleSrcSingle(ctx, *manifestStringPtr))
+		manifestLabelAttribute.SetValue(android.BazelLabelForModuleSrcSingle(ctx, *module.properties.Manifest))
+	}
+
+	var androidManifestLabelAttribute bazel.LabelAttribute
+	if module.properties.AndroidManifest != nil {
+		androidManifestLabelAttribute.SetValue(android.BazelLabelForModuleSrcSingle(ctx, *module.properties.AndroidManifest))
+	}
+
+	var fileContextsLabelAttribute bazel.LabelAttribute
+	if module.properties.File_contexts != nil {
+		fileContextsLabelAttribute.SetValue(android.BazelLabelForModuleDepSingle(ctx, *module.properties.File_contexts))
+	}
+
+	var minSdkVersion string
+	if module.properties.Min_sdk_version != nil {
+		minSdkVersion = *module.properties.Min_sdk_version
+	}
+
+	var keyLabelAttribute bazel.LabelAttribute
+	if module.overridableProperties.Key != nil {
+		keyLabelAttribute.SetValue(android.BazelLabelForModuleDepSingle(ctx, *module.overridableProperties.Key))
+	}
+
+	var certificateLabelAttribute bazel.LabelAttribute
+	if module.overridableProperties.Certificate != nil {
+		certificateLabelAttribute.SetValue(android.BazelLabelForModuleDepSingle(ctx, *module.overridableProperties.Certificate))
+	}
+
+	nativeSharedLibs := module.properties.ApexNativeDependencies.Native_shared_libs
+	nativeSharedLibsLabelList := android.BazelLabelForModuleDeps(ctx, nativeSharedLibs)
+	nativeSharedLibsLabelListAttribute := bazel.MakeLabelListAttribute(nativeSharedLibsLabelList)
+
+	prebuilts := module.overridableProperties.Prebuilts
+	prebuiltsLabelList := android.BazelLabelForModuleDeps(ctx, prebuilts)
+	prebuiltsLabelListAttribute := bazel.MakeLabelListAttribute(prebuiltsLabelList)
+
+	binaries := module.properties.ApexNativeDependencies.Binaries
+	binariesStringListAttribute := bazel.MakeStringListAttribute(binaries)
+
+	var updatableAttribute bazel.BoolAttribute
+	if module.properties.Updatable != nil {
+		updatableAttribute.Value = module.properties.Updatable
+	}
+
+	var installableAttribute bazel.BoolAttribute
+	if module.properties.Installable != nil {
+		installableAttribute.Value = module.properties.Installable
 	}
 
 	attrs := &bazelApexBundleAttributes{
-		Manifest: manifestLabelAttribute,
+		Manifest:           manifestLabelAttribute,
+		Android_manifest:   androidManifestLabelAttribute,
+		File_contexts:      fileContextsLabelAttribute,
+		Min_sdk_version:    minSdkVersion,
+		Key:                keyLabelAttribute,
+		Certificate:        certificateLabelAttribute,
+		Updatable:          updatableAttribute,
+		Installable:        installableAttribute,
+		Native_shared_libs: nativeSharedLibsLabelListAttribute,
+		Binaries:           binariesStringListAttribute,
+		Prebuilts:          prebuiltsLabelListAttribute,
 	}
 
 	props := bazel.BazelTargetModuleProperties{
@@ -3234,11 +3319,5 @@ func apexBundleBp2BuildInternal(ctx android.TopDownMutatorContext, module *apexB
 		Bzl_load_location: "//build/bazel/rules:apex.bzl",
 	}
 
-	ctx.CreateBazelTargetModule(BazelApexBundleFactory, module.Name(), props, attrs)
+	ctx.CreateBazelTargetModule(module.Name(), props, attrs)
 }
-
-func (m *bazelApexBundle) Name() string {
-	return m.BaseModuleName()
-}
-
-func (m *bazelApexBundle) GenerateAndroidBuildActions(ctx android.ModuleContext) {}

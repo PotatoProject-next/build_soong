@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -88,7 +89,8 @@ func GlobFiles(ctx EarlyModulePathContext, globPattern string, excludes []string
 // the Path methods that rely on module dependencies having been resolved.
 type ModuleWithDepsPathContext interface {
 	EarlyModulePathContext
-	GetDirectDepWithTag(name string, tag blueprint.DependencyTag) blueprint.Module
+	VisitDirectDepsBlueprint(visit func(blueprint.Module))
+	OtherModuleDependencyTag(m blueprint.Module) blueprint.DependencyTag
 }
 
 // ModuleMissingDepsPathContext is a subset of *ModuleContext methods required by
@@ -184,13 +186,13 @@ type Path interface {
 	// A standard build has the following structure:
 	//   ../top/
 	//          out/ - make install files go here.
-	//          out/soong - this is the buildDir passed to NewTestConfig()
+	//          out/soong - this is the soongOutDir passed to NewTestConfig()
 	//          ... - the source files
 	//
 	// This function converts a path so that it appears relative to the ../top/ directory, i.e.
-	// * Make install paths, which have the pattern "buildDir/../<path>" are converted into the top
+	// * Make install paths, which have the pattern "soongOutDir/../<path>" are converted into the top
 	//   relative path "out/<path>"
-	// * Soong install paths and other writable paths, which have the pattern "buildDir/<path>" are
+	// * Soong install paths and other writable paths, which have the pattern "soongOutDir/<path>" are
 	//   converted into the top relative path "out/soong/<path>".
 	// * Source paths are already relative to the top.
 	// * Phony paths are not relative to anything.
@@ -209,7 +211,7 @@ type WritablePath interface {
 	Path
 
 	// return the path to the build directory.
-	getBuildDir() string
+	getSoongOutDir() string
 
 	// the writablePath method doesn't directly do anything,
 	// but it allows a struct to distinguish between whether or not it implements the WritablePath interface
@@ -484,10 +486,27 @@ func getPathsFromModuleDep(ctx ModuleWithDepsPathContext, path, moduleName, tag 
 //
 // If tag is "" then the returned module will be the dependency that was added for ":moduleName".
 // Otherwise, it is the dependency that was added for ":moduleName{tag}".
-//
-// TODO(b/193228441) Make this handle fully qualified names, e.g. //namespace:moduleName.
 func GetModuleFromPathDep(ctx ModuleWithDepsPathContext, moduleName, tag string) blueprint.Module {
-	return ctx.GetDirectDepWithTag(moduleName, sourceOrOutputDepTag(tag))
+	var found blueprint.Module
+	// The sourceOrOutputDepTag uniquely identifies the module dependency as it contains both the
+	// module name and the tag. Dependencies added automatically for properties tagged with
+	// `android:"path"` are deduped so are guaranteed to be unique. It is possible for duplicate
+	// dependencies to be added manually using ExtractSourcesDeps or ExtractSourceDeps but even then
+	// it will always be the case that the dependencies will be identical, i.e. the same tag and same
+	// moduleName referring to the same dependency module.
+	//
+	// It does not matter whether the moduleName is a fully qualified name or if the module
+	// dependency is a prebuilt module. All that matters is the same information is supplied to
+	// create the tag here as was supplied to create the tag when the dependency was added so that
+	// this finds the matching dependency module.
+	expectedTag := sourceOrOutputDepTag(moduleName, tag)
+	ctx.VisitDirectDepsBlueprint(func(module blueprint.Module) {
+		depTag := ctx.OtherModuleDependencyTag(module)
+		if depTag == expectedTag {
+			found = module
+		}
+	})
+	return found
 }
 
 // PathsAndMissingDepsForModuleSrcExcludes returns a Paths{} containing the resolved references in
@@ -603,7 +622,7 @@ func expandOneSrcPath(ctx ModuleWithDepsPathContext, sPath string, expandedExclu
 // It intended for use in globs that only list files that exist, so it allows '$' in
 // filenames.
 func pathsForModuleSrcFromFullPath(ctx EarlyModulePathContext, paths []string, incDirs bool) Paths {
-	prefix := filepath.Join(ctx.Config().srcDir, ctx.ModuleDir()) + "/"
+	prefix := ctx.ModuleDir() + "/"
 	if prefix == "./" {
 		prefix = ""
 	}
@@ -639,7 +658,7 @@ func PathsWithOptionalDefaultForModuleSrc(ctx ModuleMissingDepsPathContext, inpu
 	}
 	// Use Glob so that if the default doesn't exist, a dependency is added so that when it
 	// is created, we're run again.
-	path := filepath.Join(ctx.Config().srcDir, ctx.ModuleDir(), def)
+	path := filepath.Join(ctx.ModuleDir(), def)
 	return Glob(ctx, path, nil)
 }
 
@@ -967,13 +986,13 @@ func (p SourcePath) withRel(rel string) SourcePath {
 // code that is embedding ninja variables in paths
 func safePathForSource(ctx PathContext, pathComponents ...string) (SourcePath, error) {
 	p, err := validateSafePath(pathComponents...)
-	ret := SourcePath{basePath{p, ""}, ctx.Config().srcDir}
+	ret := SourcePath{basePath{p, ""}, "."}
 	if err != nil {
 		return ret, err
 	}
 
 	// absolute path already checked by validateSafePath
-	if strings.HasPrefix(ret.String(), ctx.Config().buildDir) {
+	if strings.HasPrefix(ret.String(), ctx.Config().soongOutDir) {
 		return ret, fmt.Errorf("source path %q is in output", ret.String())
 	}
 
@@ -983,13 +1002,13 @@ func safePathForSource(ctx PathContext, pathComponents ...string) (SourcePath, e
 // pathForSource creates a SourcePath from pathComponents, but does not check that it exists.
 func pathForSource(ctx PathContext, pathComponents ...string) (SourcePath, error) {
 	p, err := validatePath(pathComponents...)
-	ret := SourcePath{basePath{p, ""}, ctx.Config().srcDir}
+	ret := SourcePath{basePath{p, ""}, "."}
 	if err != nil {
 		return ret, err
 	}
 
 	// absolute path already checked by validatePath
-	if strings.HasPrefix(ret.String(), ctx.Config().buildDir) {
+	if strings.HasPrefix(ret.String(), ctx.Config().soongOutDir) {
 		return ret, fmt.Errorf("source path %q is in output", ret.String())
 	}
 
@@ -1182,8 +1201,8 @@ func (p SourcePath) OverlayPath(ctx ModuleMissingDepsPathContext, path Path) Opt
 type OutputPath struct {
 	basePath
 
-	// The soong build directory, i.e. Config.BuildDir()
-	buildDir string
+	// The soong build directory, i.e. Config.SoongOutDir()
+	soongOutDir string
 
 	fullPath string
 }
@@ -1199,8 +1218,8 @@ func (p OutputPath) WithoutRel() OutputPath {
 	return p
 }
 
-func (p OutputPath) getBuildDir() string {
-	return p.buildDir
+func (p OutputPath) getSoongOutDir() string {
+	return p.soongOutDir
 }
 
 func (p OutputPath) RelativeToTop() Path {
@@ -1208,8 +1227,8 @@ func (p OutputPath) RelativeToTop() Path {
 }
 
 func (p OutputPath) outputPathRelativeToTop() OutputPath {
-	p.fullPath = StringPathRelativeToTop(p.buildDir, p.fullPath)
-	p.buildDir = OutSoongDir
+	p.fullPath = StringPathRelativeToTop(p.soongOutDir, p.fullPath)
+	p.soongOutDir = OutSoongDir
 	return p
 }
 
@@ -1250,12 +1269,12 @@ func PathForOutput(ctx PathContext, pathComponents ...string) OutputPath {
 	if err != nil {
 		reportPathError(ctx, err)
 	}
-	fullPath := filepath.Join(ctx.Config().buildDir, path)
+	fullPath := filepath.Join(ctx.Config().soongOutDir, path)
 	path = fullPath[len(fullPath)-len(path):]
-	return OutputPath{basePath{path, ""}, ctx.Config().buildDir, fullPath}
+	return OutputPath{basePath{path, ""}, ctx.Config().soongOutDir, fullPath}
 }
 
-// PathsForOutput returns Paths rooted from buildDir
+// PathsForOutput returns Paths rooted from soongOutDir
 func PathsForOutput(ctx PathContext, paths []string) WritablePaths {
 	ret := make(WritablePaths, len(paths))
 	for i, path := range paths {
@@ -1576,8 +1595,8 @@ func PathForModuleRes(ctx ModuleOutPathContext, pathComponents ...string) Module
 type InstallPath struct {
 	basePath
 
-	// The soong build directory, i.e. Config.BuildDir()
-	buildDir string
+	// The soong build directory, i.e. Config.SoongOutDir()
+	soongOutDir string
 
 	// partitionDir is the part of the InstallPath that is automatically determined according to the context.
 	// For example, it is host/<os>-<arch> for host modules, and target/product/<device>/<partition> for device modules.
@@ -1597,12 +1616,12 @@ func ensureTestOnly() {
 
 func (p InstallPath) RelativeToTop() Path {
 	ensureTestOnly()
-	p.buildDir = OutSoongDir
+	p.soongOutDir = OutSoongDir
 	return p
 }
 
-func (p InstallPath) getBuildDir() string {
-	return p.buildDir
+func (p InstallPath) getSoongOutDir() string {
+	return p.soongOutDir
 }
 
 func (p InstallPath) ReplaceExtension(ctx PathContext, ext string) OutputPath {
@@ -1617,9 +1636,9 @@ func (p InstallPath) writablePath() {}
 func (p InstallPath) String() string {
 	if p.makePath {
 		// Make path starts with out/ instead of out/soong.
-		return filepath.Join(p.buildDir, "../", p.path)
+		return filepath.Join(p.soongOutDir, "../", p.path)
 	} else {
-		return filepath.Join(p.buildDir, p.path)
+		return filepath.Join(p.soongOutDir, p.path)
 	}
 }
 
@@ -1628,9 +1647,9 @@ func (p InstallPath) String() string {
 // The ./soong is dropped if the install path is for Make.
 func (p InstallPath) PartitionDir() string {
 	if p.makePath {
-		return filepath.Join(p.buildDir, "../", p.partitionDir)
+		return filepath.Join(p.soongOutDir, "../", p.partitionDir)
 	} else {
-		return filepath.Join(p.buildDir, p.partitionDir)
+		return filepath.Join(p.soongOutDir, p.partitionDir)
 	}
 }
 
@@ -1700,7 +1719,7 @@ func pathForInstall(ctx PathContext, os OsType, arch ArchType, partition string,
 		partionPaths = []string{"target", "product", ctx.Config().DeviceName(), partition}
 	} else {
 		osName := os.String()
-		if os == Linux {
+		if os == Linux || os == LinuxMusl {
 			// instead of linux_glibc
 			osName = "linux"
 		}
@@ -1726,7 +1745,7 @@ func pathForInstall(ctx PathContext, os OsType, arch ArchType, partition string,
 
 	base := InstallPath{
 		basePath:     basePath{partionPath, ""},
-		buildDir:     ctx.Config().buildDir,
+		soongOutDir:  ctx.Config().soongOutDir,
 		partitionDir: partionPath,
 		makePath:     false,
 	}
@@ -1737,7 +1756,7 @@ func pathForInstall(ctx PathContext, os OsType, arch ArchType, partition string,
 func pathForNdkOrSdkInstall(ctx PathContext, prefix string, paths []string) InstallPath {
 	base := InstallPath{
 		basePath:     basePath{prefix, ""},
-		buildDir:     ctx.Config().buildDir,
+		soongOutDir:  ctx.Config().soongOutDir,
 		partitionDir: prefix,
 		makePath:     false,
 	}
@@ -1883,7 +1902,7 @@ type PhonyPath struct {
 
 func (p PhonyPath) writablePath() {}
 
-func (p PhonyPath) getBuildDir() string {
+func (p PhonyPath) getSoongOutDir() string {
 	// A phone path cannot contain any / so cannot be relative to the build directory.
 	return ""
 }
@@ -2126,4 +2145,26 @@ func PathsIfNonNil(paths ...Path) Paths {
 		return nil
 	}
 	return ret
+}
+
+var thirdPartyDirPrefixExceptions = []*regexp.Regexp{
+	regexp.MustCompile("^vendor/[^/]*google[^/]*/"),
+	regexp.MustCompile("^hardware/google/"),
+	regexp.MustCompile("^hardware/interfaces/"),
+	regexp.MustCompile("^hardware/libhardware[^/]*/"),
+	regexp.MustCompile("^hardware/ril/"),
+}
+
+func IsThirdPartyPath(path string) bool {
+	thirdPartyDirPrefixes := []string{"external/", "vendor/", "hardware/"}
+
+	if HasAnyPrefix(path, thirdPartyDirPrefixes) {
+		for _, prefix := range thirdPartyDirPrefixExceptions {
+			if prefix.MatchString(path) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }

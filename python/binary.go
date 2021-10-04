@@ -38,26 +38,9 @@ type bazelPythonBinaryAttributes struct {
 	Main           string
 	Srcs           bazel.LabelListAttribute
 	Data           bazel.LabelListAttribute
+	Deps           bazel.LabelListAttribute
 	Python_version string
 }
-
-type bazelPythonBinary struct {
-	android.BazelTargetModuleBase
-	bazelPythonBinaryAttributes
-}
-
-func BazelPythonBinaryFactory() android.Module {
-	module := &bazelPythonBinary{}
-	module.AddProperties(&module.bazelPythonBinaryAttributes)
-	android.InitBazelTargetModule(module)
-	return module
-}
-
-func (m *bazelPythonBinary) Name() string {
-	return m.BaseModuleName()
-}
-
-func (m *bazelPythonBinary) GenerateAndroidBuildActions(ctx android.ModuleContext) {}
 
 func PythonBinaryBp2Build(ctx android.TopDownMutatorContext) {
 	m, ok := ctx.Module().(*Module)
@@ -99,11 +82,13 @@ func PythonBinaryBp2Build(ctx android.TopDownMutatorContext) {
 
 	srcs := android.BazelLabelForModuleSrcExcludes(ctx, m.properties.Srcs, m.properties.Exclude_srcs)
 	data := android.BazelLabelForModuleSrc(ctx, m.properties.Data)
+	deps := android.BazelLabelForModuleDeps(ctx, m.properties.Libs)
 
 	attrs := &bazelPythonBinaryAttributes{
 		Main:           main,
 		Srcs:           bazel.MakeLabelListAttribute(srcs),
 		Data:           bazel.MakeLabelListAttribute(data),
+		Deps:           bazel.MakeLabelListAttribute(deps),
 		Python_version: python_version,
 	}
 
@@ -112,7 +97,7 @@ func PythonBinaryBp2Build(ctx android.TopDownMutatorContext) {
 		Rule_class: "py_binary",
 	}
 
-	ctx.CreateBazelTargetModule(BazelPythonBinaryFactory, m.Name(), props, attrs)
+	ctx.CreateBazelTargetModule(m.Name(), props, attrs)
 }
 
 type BinaryProperties struct {

@@ -334,9 +334,7 @@ custom {
 		config := android.TestConfig(buildDir, nil, testCase.bp, nil)
 		ctx := android.NewTestContext(config)
 
-		ctx.RegisterModuleType("custom", customModuleFactory)
-		ctx.RegisterBp2BuildMutator("custom", customBp2BuildMutator)
-		ctx.RegisterForBazelConversion()
+		registerCustomModuleForBp2buildConversion(ctx)
 
 		_, errs := ctx.ParseFileList(dir, []string{"Android.bp"})
 		if errored(t, "", errs) {
@@ -482,12 +480,12 @@ func TestGenerateBazelTargetModules_OneToMany_LoadedFromStarlark(t *testing.T) {
     name = "bar",
 )
 
-my_proto_library(
-    name = "bar_my_proto_library_deps",
-)
-
 proto_library(
     name = "bar_proto_library_deps",
+)
+
+my_proto_library(
+    name = "bar_my_proto_library_deps",
 )`,
 			expectedBazelTargetCount: 3,
 			expectedLoadStatements: `load("//build/bazel/rules:proto.bzl", "my_proto_library", "proto_library")
@@ -556,7 +554,6 @@ genrule {
 		moduleTypeUnderTestFactory         android.ModuleFactory
 		moduleTypeUnderTestBp2BuildMutator func(android.TopDownMutatorContext)
 		preArchMutators                    []android.RegisterMutatorFunc
-		depsMutators                       []android.RegisterMutatorFunc
 		bp                                 string
 		expectedBazelTargets               []string
 		fs                                 map[string]string
@@ -720,7 +717,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo.tool",
     out: ["foo_tool.out"],
@@ -758,7 +754,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo.tools",
     out: ["foo_tool.out", "foo_tool2.out"],
@@ -798,7 +793,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo",
     out: ["foo.out"],
@@ -822,7 +816,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo",
     out: ["foo.out"],
@@ -846,7 +839,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo",
     out: ["foo.out"],
@@ -873,7 +865,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo",
     out: ["foo.out"],
@@ -900,7 +891,6 @@ genrule {
 			moduleTypeUnderTest:                "genrule",
 			moduleTypeUnderTestFactory:         genrule.GenRuleFactory,
 			moduleTypeUnderTestBp2BuildMutator: genrule.GenruleBp2Build,
-			depsMutators:                       []android.RegisterMutatorFunc{genrule.RegisterGenruleBp2BuildDeps},
 			bp: `genrule {
     name: "foo",
     out: ["foo.out"],
@@ -933,9 +923,6 @@ genrule {
 		config := android.TestConfig(buildDir, nil, testCase.bp, fs)
 		ctx := android.NewTestContext(config)
 		ctx.RegisterModuleType(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestFactory)
-		for _, m := range testCase.depsMutators {
-			ctx.DepsBp2BuildMutators(m)
-		}
 		ctx.RegisterBp2BuildMutator(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestBp2BuildMutator)
 		ctx.RegisterForBazelConversion()
 
@@ -1226,22 +1213,24 @@ func TestAllowlistingBp2buildTargetsExplicitly(t *testing.T) {
 
 	dir := "."
 	for _, testCase := range testCases {
-		config := android.TestConfig(buildDir, nil, testCase.bp, nil)
-		ctx := android.NewTestContext(config)
-		ctx.RegisterModuleType(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestFactory)
-		ctx.RegisterBp2BuildMutator(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestBp2BuildMutator)
-		ctx.RegisterForBazelConversion()
+		t.Run(testCase.description, func(t *testing.T) {
+			config := android.TestConfig(buildDir, nil, testCase.bp, nil)
+			ctx := android.NewTestContext(config)
+			ctx.RegisterModuleType(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestFactory)
+			ctx.RegisterBp2BuildMutator(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestBp2BuildMutator)
+			ctx.RegisterForBazelConversion()
 
-		_, errs := ctx.ParseFileList(dir, []string{"Android.bp"})
-		android.FailIfErrored(t, errs)
-		_, errs = ctx.ResolveDependencies(config)
-		android.FailIfErrored(t, errs)
+			_, errs := ctx.ParseFileList(dir, []string{"Android.bp"})
+			android.FailIfErrored(t, errs)
+			_, errs = ctx.ResolveDependencies(config)
+			android.FailIfErrored(t, errs)
 
-		codegenCtx := NewCodegenContext(config, *ctx.Context, Bp2Build)
-		bazelTargets := generateBazelTargetsForDir(codegenCtx, dir)
-		if actualCount := len(bazelTargets); actualCount != testCase.expectedCount {
-			t.Fatalf("%s: Expected %d bazel target, got %d", testCase.description, testCase.expectedCount, actualCount)
-		}
+			codegenCtx := NewCodegenContext(config, *ctx.Context, Bp2Build)
+			bazelTargets := generateBazelTargetsForDir(codegenCtx, dir)
+			if actualCount := len(bazelTargets); actualCount != testCase.expectedCount {
+				t.Fatalf("%s: Expected %d bazel target, got %d", testCase.description, testCase.expectedCount, actualCount)
+			}
+		})
 	}
 }
 
@@ -1370,7 +1359,6 @@ func TestCombineBuildFilesBp2buildTargets(t *testing.T) {
 		moduleTypeUnderTestFactory         android.ModuleFactory
 		moduleTypeUnderTestBp2BuildMutator func(android.TopDownMutatorContext)
 		preArchMutators                    []android.RegisterMutatorFunc
-		depsMutators                       []android.RegisterMutatorFunc
 		bp                                 string
 		expectedBazelTargets               []string
 		fs                                 map[string]string
@@ -1487,9 +1475,6 @@ func TestCombineBuildFilesBp2buildTargets(t *testing.T) {
 			config := android.TestConfig(buildDir, nil, testCase.bp, fs)
 			ctx := android.NewTestContext(config)
 			ctx.RegisterModuleType(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestFactory)
-			for _, m := range testCase.depsMutators {
-				ctx.DepsBp2BuildMutators(m)
-			}
 			ctx.RegisterBp2BuildMutator(testCase.moduleTypeUnderTest, testCase.moduleTypeUnderTestBp2BuildMutator)
 			ctx.RegisterForBazelConversion()
 
